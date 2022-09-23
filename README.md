@@ -1,2 +1,2 @@
 # NtfsStreamsViewer
-NTFS alternate data streams viewer
+NTFS alternate data streams viewer && editor
