@@ -32,17 +32,19 @@ This project consists of three main components:
 cd core
 cargo build --release
 
-```bash
+
 cd cli
 cargo build --release
 
-```bash
+
 cd gui
 dotnet publish -c Release
+bash
+```
 
+### Usage
+**CLI Mode**
 
-Usage
-CLI Mode
 # List mounted NTFS volumes
 ads-cli volumes
 
