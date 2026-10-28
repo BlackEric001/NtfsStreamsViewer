@@ -1,0 +1,33 @@
+[package]
+name = "ads-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI and JSON-RPC server for NTFS Alternate Data Streams viewer"
+
+[[bin]]
+name = "ads-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ntfs-streams-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-util = "0.7"
+futures = "0.3"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+ntfs-streams-core = { path = "../core" }
+tempfile = "3"
+tokio = { workspace = true }
+async-trait = "0.1"
