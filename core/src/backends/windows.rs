@@ -18,13 +18,7 @@ use windows::Win32::Foundation::{
     ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, HANDLE,
     INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetLogicalDriveStringsW, GetVolumeInformationW, ReadFile, SetFilePointerEx,
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
-};
+use windows::Win32::Storage::FileSystem::{CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW, ReadFile, SetFilePointerEx, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA, FindStreamInfoStandard};
 // In the `windows` 0.58 crate DRIVE_* constants live in
 // Win32::System::WindowsProgramming (they are plain `u32`, matching the
 // `u32` return type of `GetDriveTypeW`).
@@ -209,7 +203,7 @@ impl WindowsBackend {
             let mut data = WIN32_FIND_STREAM_DATA::default();
             let find = FindFirstStreamW(
                 PCWSTR(wide.as_ptr()),
-                STREAM_INFO_LEVELS::FindStreamInfoStandard,
+                FindStreamInfoStandard,
                 &mut data as *mut _ as *mut c_void,
                 0,
             );
