@@ -15,14 +15,15 @@ use tokio_util::sync::CancellationToken;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
-    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, HANDLE,
+    INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW,
     GetVolumeInformationW, ReadFile, SetFilePointerEx, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
 };
 use windows::Win32::System::WindowsProgramming::{GetDriveTypeW, DRIVE_FIXED, DRIVE_REMOVABLE};
 
@@ -84,10 +85,10 @@ pub(crate) fn build_stream_path(path: &Path, stream_name: &str) -> String {
 unsafe fn open_stream_read(path: &Path, stream_name: &str) -> Result<HANDLE, crate::error::CoreError> {
     let full = build_stream_path(path, stream_name);
     let wide = to_wide(&full);
-    // FILE_ATTRIBUTE_SEQUENTIAL_SCAN == FILE_FLAG_SEQUENTIAL_SCAN (0x10000000)
-    // and already includes FILE_ATTRIBUTE_NORMAL.
+    // FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) is a CreateFileW *flag*, not an
+    // attribute; it must be OR-ed with FILE_ATTRIBUTE_NORMAL.
     let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
-    let flags = FILE_ATTRIBUTE_SEQUENTIAL_SCAN;
+    let flags = FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_SEQUENTIAL_SCAN.0 | FILE_ATTRIBUTE_NORMAL.0);
     let disposition = OPEN_EXISTING;
     let handle = CreateFileW(
         PCWSTR(wide.as_ptr()),
