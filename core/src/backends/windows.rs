@@ -15,16 +15,20 @@ use tokio_util::sync::CancellationToken;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
-    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, HANDLE,
+    INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW,
-    GetVolumeInformationW, ReadFile, SetFilePointerEx, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION,
+    CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetDriveTypeW,
+    GetLogicalDriveStringsW, GetVolumeInformationW, ReadFile, SetFilePointerEx,
+    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_BEGIN, FILE_CREATION_DISPOSITION,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
 };
-use windows::Win32::System::WindowsProgramming::{GetDriveTypeW, DRIVE_FIXED, DRIVE_REMOVABLE};
+// In the `windows` 0.58 crate DRIVE_* constants live in
+// Win32::System::WindowsProgramming (they are plain `u32`, matching the
+// `u32` return type of `GetDriveTypeW`).
+use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 
 /// Copy block size used for exports (SPEC §3.3: 64 KiB – 1 MiB).
 const BLOCK_SIZE: usize = 256 * 1024;
@@ -84,10 +88,10 @@ pub(crate) fn build_stream_path(path: &Path, stream_name: &str) -> String {
 unsafe fn open_stream_read(path: &Path, stream_name: &str) -> Result<HANDLE, crate::error::CoreError> {
     let full = build_stream_path(path, stream_name);
     let wide = to_wide(&full);
-    // FILE_ATTRIBUTE_SEQUENTIAL_SCAN == FILE_FLAG_SEQUENTIAL_SCAN (0x10000000)
-    // and already includes FILE_ATTRIBUTE_NORMAL.
+    // FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) is a CreateFileW *flag*, not an
+    // attribute; it must be OR-ed with FILE_ATTRIBUTE_NORMAL.
     let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
-    let flags = FILE_ATTRIBUTE_SEQUENTIAL_SCAN;
+    let flags = FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_SEQUENTIAL_SCAN.0 | FILE_ATTRIBUTE_NORMAL.0);
     let disposition = OPEN_EXISTING;
     let handle = CreateFileW(
         PCWSTR(wide.as_ptr()),
@@ -215,7 +219,10 @@ impl WindowsBackend {
                     // `FindFirstStreamW` reports "no streams" / missing file via
                     // the last-error code; consult it explicitly.
                     let err = GetLastError();
-                    if err == ERROR_NO_MORE_FILES || err == ERROR_HANDLE_EOF {
+                    if err == ERROR_NO_MORE_FILES
+                        || err == ERROR_NO_MORE_ITEMS
+                        || err == ERROR_HANDLE_EOF
+                    {
                         return Ok(Vec::new());
                     }
                     return Err(win_error(err, &path.display().to_string()));
@@ -236,7 +243,13 @@ impl WindowsBackend {
                 }
                 if FindNextStreamW(find, &mut data as *mut _ as *mut c_void).is_err() {
                     let err = GetLastError();
-                    if err == ERROR_HANDLE_EOF || err == ERROR_NO_MORE_FILES {
+                    // End of enumeration is reported as ERROR_HANDLE_EOF /
+                    // ERROR_NO_MORE_FILES; on some Windows versions the
+                    // more-data-pending semantics surface as ERROR_MORE_DATA.
+                    if err == ERROR_HANDLE_EOF
+                        || err == ERROR_NO_MORE_FILES
+                        || err == ERROR_MORE_DATA
+                    {
                         break;
                     }
                     let _ = CloseHandle(find);
