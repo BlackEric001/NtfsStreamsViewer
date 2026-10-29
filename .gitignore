@@ -1,46 +1,4 @@
-# Rust
-target/
-**/*.rs.bk
-*.pdb
-Cargo.lock
-
-# .NET
-[Bb]in/
-[Oo]bj/
-[Dd]ebug/
-[Rr]elease/
-.vs/
-*.user
-*.suo
-*.userosscache
-*.sln.docstates
-packages/
-*.nupkg
-*.snupkg
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Build artifacts
-*.dll
-*.so
-*.dylib
-*.exe
-
-# Logs
+/target
+**/target
+*.bundle
 *.log
-logs/
-
-# Temporary files
-*.tmp
-*.temp
-.cache/

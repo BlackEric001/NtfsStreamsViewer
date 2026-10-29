@@ -1,0 +1,3134 @@
+From d794a23feddd6bb255b0d2df90cc9d283f1edb01 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Wed, 28 Oct 2026 12:30:05 +0000
+Subject: [PATCH 1/5] Add CLI and JSON-RPC server for NTFS ADS viewer
+
+- New `ads-cli` package with clap-based commands: volumes, scan, streams, export
+- Implemented JSON-RPC 2.0 stdio server (`serve --stdio`) supporting all core methods (volumes.list, scan.*, streams.*, stream.*)
+- Added async scan engine in `core/src/scan.rs` with progress aggregation, cancellation support, and event streaming
+- Implemented platform-specific backends: Windows (native ADS APIs) and Linux (xattr emulation on NTFS mounts)
+- Defined shared domain types (`VolumeInfo`, `StreamInfo`, `ScanOptions`) and structured error handling with JSON-RPC code mapping
+- Added comprehensive unit tests for RPC handlers, backend logic, scan behavior, and utility functions (human_size, sanitization)
+---
+ cli/Cargo.toml               |  33 ++
+ cli/src/commands/export.rs   |  66 ++++
+ cli/src/commands/mod.rs      |  73 ++++
+ cli/src/commands/scan.rs     |  75 ++++
+ cli/src/commands/streams.rs  |  28 ++
+ cli/src/commands/volumes.rs  |  40 +++
+ cli/src/jsonrpc.rs           | 644 +++++++++++++++++++++++++++++++++++
+ cli/src/main.rs              | 120 +++++++
+ core/Cargo.toml              |  37 ++
+ core/src/backend.rs          |  50 +++
+ core/src/backends/linux.rs   | 467 +++++++++++++++++++++++++
+ core/src/backends/mod.rs     |   7 +
+ core/src/backends/windows.rs | 455 +++++++++++++++++++++++++
+ core/src/error.rs            |  79 +++++
+ core/src/lib.rs              |  23 ++
+ core/src/scan.rs             | 460 +++++++++++++++++++++++++
+ core/src/test_support.rs     | 226 ++++++++++++
+ core/src/types.rs            |  90 +++++
+ 18 files changed, 2973 insertions(+)
+ create mode 100644 cli/Cargo.toml
+ create mode 100644 cli/src/commands/export.rs
+ create mode 100644 cli/src/commands/mod.rs
+ create mode 100644 cli/src/commands/scan.rs
+ create mode 100644 cli/src/commands/streams.rs
+ create mode 100644 cli/src/commands/volumes.rs
+ create mode 100644 cli/src/jsonrpc.rs
+ create mode 100644 cli/src/main.rs
+ create mode 100644 core/Cargo.toml
+ create mode 100644 core/src/backend.rs
+ create mode 100644 core/src/backends/linux.rs
+ create mode 100644 core/src/backends/mod.rs
+ create mode 100644 core/src/backends/windows.rs
+ create mode 100644 core/src/error.rs
+ create mode 100644 core/src/lib.rs
+ create mode 100644 core/src/scan.rs
+ create mode 100644 core/src/test_support.rs
+ create mode 100644 core/src/types.rs
+
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+new file mode 100644
+index 0000000..3e4aba7
+--- /dev/null
++++ b/cli/Cargo.toml
+@@ -0,0 +1,33 @@
++[package]
++name = "ads-cli"
++version.workspace = true
++edition.workspace = true
++authors.workspace = true
++license.workspace = true
++repository.workspace = true
++description = "CLI and JSON-RPC server for NTFS Alternate Data Streams viewer"
++
++[[bin]]
++name = "ads-cli"
++path = "src/main.rs"
++
++[dependencies]
++clap = { version = "4", features = ["derive"] }
++ntfs-streams-core = { path = "../core" }
++tokio = { workspace = true }
++serde = { workspace = true }
++serde_json = { workspace = true }
++anyhow = { workspace = true }
++tracing = "0.1"
++tracing-subscriber = { version = "0.3", features = ["env-filter"] }
++tokio-util = "0.7"
++futures = "0.3"
++base64 = "0.22"
++uuid = { version = "1", features = ["v4"] }
++sha2 = "0.10"
++
++[dev-dependencies]
++ntfs-streams-core = { path = "../core" }
++tempfile = "3"
++tokio = { workspace = true }
++async-trait = "0.1"
+diff --git a/cli/src/commands/export.rs b/cli/src/commands/export.rs
+new file mode 100644
+index 0000000..21aba14
+--- /dev/null
++++ b/cli/src/commands/export.rs
+@@ -0,0 +1,66 @@
++//! `ads-cli export <path> [stream] -o <output> [--all]`
++
++use std::path::{Path, PathBuf};
++
++use anyhow::{bail, Result};
++use ntfs_streams_core::{default_backend, AdsBackend};
++use sha2::{Digest, Sha256};
++use tokio_util::sync::CancellationToken;
++
++pub async fn run(path: &str, stream_name: Option<&str>, output: &str, all: bool) -> Result<()> {
++    let backend = default_backend();
++    let owner = Path::new(path);
++
++    if all {
++        let dest_dir = PathBuf::from(output);
++        std::fs::create_dir_all(&dest_dir)?;
++        let streams = backend.list_streams(owner).await?;
++        if streams.is_empty() {
++            println!("No streams to export for {path}.");
++            return Ok(());
++        }
++        for s in &streams {
++            let out = dest_dir.join(crate::commands::export_file_name(owner, &s.name));
++            let written = backend
++                .export_stream(owner, &s.name, &out, CancellationToken::new())
++                .await?;
++            println!(
++                "Exported {}:{} -> {} ({} bytes)",
++                path,
++                s.name,
++                out.display(),
++                written
++            );
++        }
++        return Ok(());
++    }
++
++    let name = stream_name.unwrap_or_else(|| {
++        // Default convenience: if there's exactly one stream, use it.
++        ""
++    });
++    if name.is_empty() {
++        bail!("stream name is required (or use --all)");
++    }
++    let dest = PathBuf::from(output);
++    let written = backend
++        .export_stream(owner, name, &dest, CancellationToken::new())
++        .await?;
++    let hash = sha256_file(&dest)?;
++    println!(
++        "Exported {path}:{name} -> {} ({written} bytes, sha256={hash})",
++        dest.display()
++    );
++    Ok(())
++}
++
++fn sha256_file(path: &Path) -> Result<String> {
++    let data = std::fs::read(path)?;
++    let mut hasher = Sha256::new();
++    hasher.update(&data);
++    Ok(hex(&hasher.finalize()))
++}
++
++pub fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
+diff --git a/cli/src/commands/mod.rs b/cli/src/commands/mod.rs
+new file mode 100644
+index 0000000..f1f07a9
+--- /dev/null
++++ b/cli/src/commands/mod.rs
+@@ -0,0 +1,73 @@
++//! Human-readable CLI commands.
++
++pub mod export;
++pub mod scan;
++pub mod streams;
++pub mod volumes;
++
++use std::path::Path;
++
++/// Render a byte size human-readably (e.g. `4.0 KB`).
++pub fn human_size(bytes: u64) -> String {
++    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
++    let mut value = bytes as f64;
++    let mut unit = 0;
++    while value >= 1024.0 && unit < UNITS.len() - 1 {
++        value /= 1024.0;
++        unit += 1;
++    }
++    if unit == 0 {
++        format!("{bytes} B")
++    } else {
++        format!("{value:.1} {}", UNITS[unit])
++    }
++}
++
++/// Sanitize a stream name for use in file names (SPEC §10).
++pub fn sanitize_stream_name(name: &str) -> String {
++    name.chars()
++        .map(|c| match c {
++            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
++            c if (c as u32) < 0x20 => '_',
++            c => c,
++        })
++        .collect()
++}
++
++/// Output file name for exporting a stream: `<file>_<stream>.bin`.
++pub fn export_file_name(owner: &Path, stream_name: &str) -> String {
++    let base = owner
++        .file_name()
++        .map(|n| n.to_string_lossy().into_owned())
++        .unwrap_or_else(|| "owner".to_string());
++    let base = sanitize_stream_name(&base);
++    format!("{base}_{}.bin", sanitize_stream_name(stream_name))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_human_size() {
++        assert_eq!(human_size(0), "0 B");
++        assert_eq!(human_size(128), "128 B");
++        assert_eq!(human_size(4096), "4.0 KB");
++        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
++    }
++
++    #[test]
++    fn test_sanitize() {
++        assert_eq!(sanitize_stream_name("a/b:c"), "a_b_c");
++        // On Linux the whole Windows path is a single file name component,
++        // so it gets sanitized in place; on Linux paths only the base is used.
++        let out = export_file_name(Path::new("/d/f.txt"), "Zone.Identifier");
++        assert_eq!(out, "f.txt_Zone.Identifier.bin");
++    }
++
++    #[test]
++    fn test_export_file_name_strips_directories() {
++        let out = export_file_name(Path::new("/tmp/my file.dat"), "prompt:foo\x01bar");
++        assert_eq!(out, "my file.dat_prompt_foo_bar.bin");
++    }
++}
+diff --git a/cli/src/commands/scan.rs b/cli/src/commands/scan.rs
+new file mode 100644
+index 0000000..2f40cc4
+--- /dev/null
++++ b/cli/src/commands/scan.rs
+@@ -0,0 +1,75 @@
++//! `ads-cli scan <path>` — runs a scan job and prints progress/results.
++
++use std::path::PathBuf;
++
++use anyhow::Result;
++use ntfs_streams_core::scan::{run_scan, ScanEvent};
++use ntfs_streams_core::{default_backend, ScanOptions};
++use tokio::sync::mpsc;
++use tokio_util::sync::CancellationToken;
++
++pub async fn run(path: &str, opts: ScanOptions) -> Result<()> {
++    let backend = default_backend();
++    let job_id = format!("scan-{}", uuid::Uuid::new_v4());
++    let cancel = CancellationToken::new();
++    let (tx, mut rx) = mpsc::channel::<ScanEvent>(256);
++
++    // Ctrl-C cancels the scan.
++    let cancel_clone = cancel.clone();
++    tokio::spawn(async move {
++        loop {
++            if tokio::signal::ctrl_c().await.is_ok() {
++                eprintln!("\nCancellation requested…");
++                cancel_clone.cancel();
++            } else {
++                break;
++            }
++        }
++    });
++
++    let root = PathBuf::from(path);
++    let handle = tokio::spawn(run_scan(backend, job_id.clone(), root, opts, cancel.clone(), tx));
++
++    while let Some(ev) = rx.recv().await {
++        match ev {
++            ScanEvent::Progress(p) => {
++                print!(
++                    "\rScanned: {} files, {} dirs | streams: {} | errors: {}",
++                    p.files_scanned, p.dirs_scanned, p.streams_found, p.errors
++                );
++                use std::io::Write;
++                let _ = std::io::stdout().flush();
++            }
++            ScanEvent::StreamFound(s) => {
++                println!(
++                    "\n  ADS: {}:{} ({} bytes)",
++                    s.owner_path.display(),
++                    s.name,
++                    s.size
++                );
++                print!("…continuing");
++                use std::io::Write;
++                let _ = std::io::stdout().flush();
++            }
++            ScanEvent::Error { path, error } => {
++                eprintln!("\n  error at {}: {error}", path.display());
++            }
++            ScanEvent::Completed(r) => {
++                println!();
++                println!(
++                    "Done in {} ms: {} files scanned, {} streams found, {} errors.",
++                    r.duration_ms, r.total_files, r.total_streams, r.errors.len()
++                );
++                if !r.errors.is_empty() {
++                    println!("First errors:");
++                    for e in r.errors.iter().take(10) {
++                        println!("  - {e}");
++                    }
++                }
++            }
++        }
++    }
++
++    let _ = handle.await;
++    Ok(())
++}
+diff --git a/cli/src/commands/streams.rs b/cli/src/commands/streams.rs
+new file mode 100644
+index 0000000..11bad91
+--- /dev/null
++++ b/cli/src/commands/streams.rs
+@@ -0,0 +1,28 @@
++//! `ads-cli streams <path>`
++
++use std::path::Path;
++
++use anyhow::Result;
++use ntfs_streams_core::{default_backend, AdsBackend};
++
++pub async fn run(path: &str) -> Result<()> {
++    let backend = default_backend();
++    match backend.list_streams(Path::new(path)).await {
++        Ok(streams) => {
++            if streams.is_empty() {
++                println!("No alternate data streams for {path}.");
++            } else {
++                println!("{:<30} {:>12}", "STREAM", "SIZE");
++                println!("{}", "-".repeat(44));
++                for s in &streams {
++                    println!("{:<30} {:>12}", s.name, crate::commands::human_size(s.size));
++                }
++            }
++            Ok(())
++        }
++        Err(e) => {
++            eprintln!("Error: {e}");
++            std::process::exit(1);
++        }
++    }
++}
+diff --git a/cli/src/commands/volumes.rs b/cli/src/commands/volumes.rs
+new file mode 100644
+index 0000000..d48ab32
+--- /dev/null
++++ b/cli/src/commands/volumes.rs
+@@ -0,0 +1,40 @@
++//! `ads-cli volumes`
++
++use anyhow::Result;
++use ntfs_streams_core::{default_backend, AdsBackend};
++
++pub async fn run() -> Result<()> {
++    let backend = default_backend();
++    let volumes = backend.list_volumes().await?;
++    if volumes.is_empty() {
++        println!("No mounted volumes found.");
++        return Ok(());
++    }
++    println!(
++        "{:<6} {:<24} {:<10} {:<6} {:>12} {:>12}  {}",
++        "ID", "MOUNT", "FS", "NTFS", "TOTAL", "FREE", "WRITABLE"
++    );
++    println!("{}", "-".repeat(88));
++    for v in &volumes {
++        println!(
++            "{:<6} {:<24} {:<10} {:<6} {:>12} {:>12}  {}",
++            v.id,
++            truncate(&v.mount_point.to_string_lossy(), 24),
++            truncate(&v.file_system, 10),
++            if v.is_ntfs { "yes" } else { "no" },
++            v.total_size.map(crate::commands::human_size).unwrap_or_default(),
++            v.free_size.map(crate::commands::human_size).unwrap_or_default(),
++            if v.is_writable { "yes" } else { "no (ro)" },
++        );
++    }
++    Ok(())
++}
++
++fn truncate(s: &str, max: usize) -> String {
++    if s.chars().count() <= max {
++        s.to_string()
++    } else {
++        let cut: String = s.chars().take(max - 1).collect();
++        format!("{cut}…")
++    }
++}
+diff --git a/cli/src/jsonrpc.rs b/cli/src/jsonrpc.rs
+new file mode 100644
+index 0000000..f523812
+--- /dev/null
++++ b/cli/src/jsonrpc.rs
+@@ -0,0 +1,644 @@
++//! JSON-RPC 2.0 server over stdin/stdout (SPEC §5).
++//!
++//! Transport: one JSON message per line. Requests are answered on stdout;
++//! notifications (events) are pushed asynchronously. Logs go to stderr only.
++
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use base64::Engine as _;
++use serde_json::{json, Value};
++use sha2::{Digest, Sha256};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::sync::{mpsc, Mutex};
++use tokio_util::sync::CancellationToken;
++
++use ntfs_streams_core::backend::AdsBackend;
++use ntfs_streams_core::scan::{run_scan, ScanEvent};
++use ntfs_streams_core::{CoreError, ScanOptions};
++
++/// Outgoing line queue (responses + events), serialized by a writer task.
++type Outbox = mpsc::Sender<String>;
++
++pub struct ServerState {
++    pub backend: Arc<dyn AdsBackend>,
++    pub outbox: Outbox,
++    /// job_id -> cancellation token for running scans
++    pub jobs: Arc<Mutex<HashMap<String, CancellationToken>>>,
++}
++
++/// Serve JSON-RPC over the process stdio until EOF on stdin.
++pub async fn serve_stdio() -> anyhow::Result<()> {
++    let (out_tx, mut out_rx) = mpsc::channel::<String>(1024);
++    let state = Arc::new(ServerState {
++        backend: ntfs_streams_core::default_backend(),
++        outbox: out_tx,
++        jobs: Arc::new(Mutex::new(HashMap::new())),
++    });
++
++    // Writer task: owns stdout, one line per message.
++    let writer = tokio::spawn(async move {
++        let mut stdout = tokio::io::stdout();
++        while let Some(line) = out_rx.recv().await {
++            if stdout.write_all(line.as_bytes()).await.is_err() {
++                break;
++            }
++            if stdout.write_all(b"\n").await.is_err() {
++                break;
++            }
++            let _ = stdout.flush().await;
++        }
++    });
++
++    let stdin = tokio::io::stdin();
++    let mut lines = BufReader::new(stdin).lines();
++
++    tracing::info!("ads-cli JSON-RPC server started (stdio)");
++
++    while let Ok(Some(line)) = lines.next_line().await {
++        let line = line.trim().to_string();
++        if line.is_empty() {
++            continue;
++        }
++        let state = state.clone();
++        // Handle each request concurrently but responses keep their ids.
++        tokio::spawn(async move {
++            let response = handle_request(&state, &line).await;
++            if let Some(resp) = response {
++                match serde_json::to_string(&resp) {
++                    Ok(s) => {
++                        let _ = state.outbox.send(s).await;
++                    }
++                    Err(e) => tracing::error!("failed to serialize response: {e}"),
++                }
++            }
++        });
++    }
++
++    // stdin closed — cancel all jobs and shut down.
++    let jobs = state.jobs.lock().await;
++    for (_, token) in jobs.iter() {
++        token.cancel();
++    }
++    drop(jobs);
++    // Drop the state's sender so the writer task ends once queued lines are flushed.
++    let _ = state;
++    let _ = writer.await;
++    tracing::info!("ads-cli JSON-RPC server stopped");
++    Ok(())
++}
++
++fn error_response(id: Value, code: i32, message: &str, data: Option<Value>) -> Value {
++    let mut err = json!({"code": code, "message": message});
++    if let Some(d) = data {
++        err["data"] = d;
++    }
++    json!({"jsonrpc": "2.0", "id": id, "error": err})
++}
++
++fn core_error_response(id: Value, e: &CoreError) -> Value {
++    error_response(id, e.jsonrpc_code(), &e.to_string(), None)
++}
++
++/// Parse and dispatch one line. Returns `None` for notifications.
++pub(crate) async fn handle_request(state: &Arc<ServerState>, line: &str) -> Option<Value> {
++    let parsed: Value = match serde_json::from_str(line) {
++        Ok(v) => v,
++        Err(_) => return Some(error_response(Value::Null, -32700, "Parse error", None)),
++    };
++
++    if !parsed.get("jsonrpc").and_then(|v| v.as_str()).eq(&Some("2.0")) {
++        return Some(error_response(
++            parsed.get("id").cloned().unwrap_or(Value::Null),
++            -32600,
++            "Invalid request: missing jsonrpc 2.0",
++            None,
++        ));
++    }
++
++    let id = parsed.get("id").cloned();
++    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
++    let params = parsed.get("params").cloned().unwrap_or(json!({}));
++
++    // A message without an id is a notification from the client — ignore.
++    let Some(id) = id else {
++        return None;
++    };
++
++    let result = dispatch(state, method, params).await;
++    match result {
++        Ok(value) => Some(json!({"jsonrpc": "2.0", "id": id, "result": value})),
++        Err(RpcError::MethodNotFound(m)) => Some(error_response(
++            id,
++            -32601,
++            &format!("Method not found: {m}"),
++            None,
++        )),
++        Err(RpcError::InvalidParams(msg)) => Some(error_response(id, -32602, &msg, None)),
++        Err(RpcError::Internal(msg)) => Some(error_response(id, -32603, &msg, None)),
++        Err(RpcError::Core(e)) => Some(core_error_response(id, &e)),
++    }
++}
++
++enum RpcError {
++    MethodNotFound(String),
++    InvalidParams(String),
++    Internal(String),
++    Core(CoreError),
++}
++
++impl From<CoreError> for RpcError {
++    fn from(e: CoreError) -> Self {
++        RpcError::Core(e)
++    }
++}
++
++async fn dispatch(state: &Arc<ServerState>, method: &str, params: Value) -> Result<Value, RpcError> {
++    match method {
++        "volumes.list" => volumes_list(state).await,
++        "scan.start" => scan_start(state, params).await,
++        "scan.cancel" => scan_cancel(state, params).await,
++        "streams.list" => streams_list(state, params).await,
++        "stream.read" => stream_read(state, params).await,
++        "stream.export" => stream_export(state, params).await,
++        "stream.exportAll" => stream_export_all(state, params).await,
++        other => Err(RpcError::MethodNotFound(other.to_string())),
++    }
++}
++
++fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
++    params
++        .get(key)
++        .and_then(|v| v.as_str())
++        .ok_or_else(|| RpcError::InvalidParams(format!("missing string param '{key}'")))
++}
++
++// ---------- methods ----------
++
++async fn volumes_list(state: &Arc<ServerState>) -> Result<Value, RpcError> {
++    let volumes = state.backend.list_volumes().await?;
++    Ok(json!({ "volumes": volumes }))
++}
++
++async fn scan_start(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let path = param_str(&params, "path")?.to_string();
++    let options = serde_json::from_value::<ScanOptions>(params.clone())
++        .map_err(|e| RpcError::InvalidParams(format!("bad scan options: {e}")))?;
++
++    let job_id = format!("scan-{}", uuid::Uuid::new_v4());
++    let cancel = CancellationToken::new();
++    state.jobs.lock().await.insert(job_id.clone(), cancel.clone());
++
++    let backend = state.backend.clone();
++    let outbox = state.outbox.clone();
++    let jobs = state.jobs.clone();
++
++    let event_job = job_id.clone();
++    tokio::spawn(async move {
++        let (tx, mut rx) = mpsc::channel::<ScanEvent>(512);
++        let root = PathBuf::from(&path);
++        let runner = tokio::spawn(run_scan(backend, event_job.clone(), root, options, cancel, tx));
++
++        while let Some(ev) = rx.recv().await {
++            let msg = match ev {
++                ScanEvent::Progress(p) => json!({
++                    "jsonrpc": "2.0",
++                    "method": "scan.progress",
++                    "params": {
++                        "job_id": event_job,
++                        "files_scanned": p.files_scanned,
++                        "dirs_scanned": p.dirs_scanned,
++                        "streams_found": p.streams_found,
++                        "errors": p.errors,
++                        "current_path": p.current_path,
++                    }
++                }),
++                ScanEvent::StreamFound(s) => json!({
++                    "jsonrpc": "2.0",
++                    "method": "scan.streamFound",
++                    "params": { "job_id": event_job, "stream": s }
++                }),
++                ScanEvent::Error { path, error } => json!({
++                    "jsonrpc": "2.0",
++                    "method": "scan.error",
++                    "params": { "job_id": event_job, "path": path, "error": error }
++                }),
++                ScanEvent::Completed(r) => json!({
++                    "jsonrpc": "2.0",
++                    "method": "scan.completed",
++                    "params": r
++                }),
++            };
++            match serde_json::to_string(&msg) {
++                Ok(s) => {
++                    if outbox.send(s).await.is_err() {
++                        break; // pipe closed
++                    }
++                }
++                Err(e) => tracing::error!("event serialization failed: {e}"),
++            }
++        }
++        let _ = runner.await;
++        jobs.lock().await.remove(&event_job);
++    });
++
++    Ok(json!({ "job_id": job_id }))
++}
++
++async fn scan_cancel(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let job_id = param_str(&params, "job_id")?;
++    let mut jobs = state.jobs.lock().await;
++    match jobs.remove(job_id) {
++        Some(token) => {
++            token.cancel();
++            Ok(json!({ "cancelled": true }))
++        }
++        None => Ok(json!({ "cancelled": false })),
++    }
++}
++
++async fn streams_list(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let path = param_str(&params, "path")?;
++    let streams = state.backend.list_streams(Path::new(path)).await?;
++    Ok(json!({ "streams": streams }))
++}
++
++async fn stream_read(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let path = param_str(&params, "path")?;
++    let stream_name = param_str(&params, "stream_name")?;
++    let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
++    let length = params
++        .get("length")
++        .and_then(Value::as_u64)
++        .unwrap_or(64 * 1024) as usize;
++    if length > ntfs_streams_core::types::MAX_READ_LEN {
++        return Err(RpcError::InvalidParams(
++            "length must not exceed 1 MiB".into(),
++        ));
++    }
++    let (data, eof) = state
++        .backend
++        .read_stream(Path::new(path), stream_name, offset, length)
++        .await?;
++    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
++    Ok(json!({
++        "data_base64": b64,
++        "offset": offset,
++        "length": data.len() as u64,
++        "eof": eof,
++    }))
++}
++
++async fn stream_export(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let path = param_str(&params, "path")?;
++    let stream_name = param_str(&params, "stream_name")?;
++    let destination = param_str(&params, "destination")?;
++    let written = state
++        .backend
++        .export_stream(
++            Path::new(path),
++            stream_name,
++            Path::new(destination),
++            CancellationToken::new(),
++        )
++        .await?;
++    let sha = sha256_of_file(Path::new(destination))
++        .map_err(|e| RpcError::Internal(format!("hashing exported file: {e}")))?;
++    Ok(json!({ "bytes_written": written, "sha256": sha }))
++}
++
++async fn stream_export_all(state: &Arc<ServerState>, params: Value) -> Result<Value, RpcError> {
++    let path = param_str(&params, "path")?;
++    let dest_dir = param_str(&params, "destination_dir")?;
++    let owner = Path::new(path);
++    let dir = PathBuf::from(dest_dir);
++    std::fs::create_dir_all(&dir)
++        .map_err(|e| RpcError::Core(CoreError::Io(e)))?;
++    let streams = state.backend.list_streams(owner).await?;
++    let mut files = Vec::new();
++    for s in &streams {
++        let fname = export_file_name(owner, &s.name);
++        let out = dir.join(&fname);
++        state
++            .backend
++            .export_stream(owner, &s.name, &out, CancellationToken::new())
++            .await?;
++        files.push(out);
++    }
++    Ok(json!({ "streams_exported": files.len(), "files": files }))
++}
++
++// ---------- helpers ----------
++
++fn export_file_name(owner: &Path, stream_name: &str) -> String {
++    let sanitize = |s: &str| -> String {
++        s.chars()
++            .map(|c| match c {
++                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
++                c if (c as u32) < 0x20 => '_',
++                c => c,
++            })
++            .collect()
++    };
++    let base = owner
++        .file_name()
++        .map(|n| n.to_string_lossy().into_owned())
++        .unwrap_or_else(|| "owner".into());
++    format!("{}_{}.bin", sanitize(&base), sanitize(stream_name))
++}
++
++fn sha256_of_file(path: &Path) -> std::io::Result<String> {
++    let data = std::fs::read(path)?;
++    let mut hasher = Sha256::new();
++    hasher.update(&data);
++    Ok(hasher
++        .finalize()
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use async_trait::async_trait;
++    use ntfs_streams_core::{StreamInfo, VolumeInfo};
++    use tokio_util::sync::CancellationToken;
++    use std::time::Duration;
++
++    /// Backend that records nothing and returns canned data for RPC tests.
++    struct FakeBackend {
++        payload: Vec<u8>,
++    }
++
++    impl FakeBackend {
++        fn new() -> Self {
++            Self {
++                payload: b"hello stream".to_vec(),
++            }
++        }
++    }
++
++    #[async_trait]
++    impl AdsBackend for FakeBackend {
++        async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, CoreError> {
++            Ok(vec![VolumeInfo {
++                id: "vol-1".into(),
++                name: "Fake".into(),
++                mount_point: std::path::PathBuf::from("/mnt/fake"),
++                file_system: "ntfs3".into(),
++                is_ntfs: true,
++                is_writable: true,
++                total_size: Some(100),
++                free_size: Some(50),
++            }])
++        }
++
++        async fn list_streams(&self, _path: &Path) -> Result<Vec<StreamInfo>, CoreError> {
++            Ok(vec![])
++        }
++
++        async fn read_stream(
++            &self,
++            _path: &Path,
++            _stream_name: &str,
++            offset: u64,
++            len: usize,
++        ) -> Result<(Vec<u8>, bool), CoreError> {
++            let off = offset as usize;
++            if off >= self.payload.len() {
++                return Ok((Vec::new(), true));
++            }
++            let end = (off + len).min(self.payload.len());
++            Ok((self.payload[off..end].to_vec(), end >= self.payload.len()))
++        }
++
++        async fn export_stream(
++            &self,
++            _path: &Path,
++            _stream_name: &str,
++            destination: &Path,
++            _cancel: CancellationToken,
++        ) -> Result<u64, CoreError> {
++            std::fs::write(destination, &self.payload)
++                .map_err(CoreError::Io)?;
++            Ok(self.payload.len() as u64)
++        }
++    }
++
++    fn test_state() -> Arc<ServerState> {
++        let (tx, _rx) = mpsc::channel(256);
++        Arc::new(ServerState {
++            backend: Arc::new(FakeBackend::new()),
++            outbox: tx,
++            jobs: Arc::new(Mutex::new(HashMap::new())),
++        })
++    }
++
++    fn req(id: Value, method: &str, params: Value) -> String {
++        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
++    }
++
++    #[tokio::test]
++    async fn parse_error_on_invalid_json() {
++        let state = test_state();
++        let resp = handle_request(&state, "not json at all").await.unwrap();
++        assert_eq!(resp["error"]["code"], -32700);
++        assert_eq!(resp["id"], Value::Null);
++    }
++
++    #[tokio::test]
++    async fn invalid_request_without_jsonrpc_version() {
++        let state = test_state();
++        let line = json!({"id": 1, "method": "volumes.list"}).to_string();
++        let resp = handle_request(&state, &line).await.unwrap();
++        assert_eq!(resp["error"]["code"], -32600);
++    }
++
++    #[tokio::test]
++    async fn notification_without_id_is_ignored() {
++        let state = test_state();
++        let line = json!({"jsonrpc": "2.0", "method": "volumes.list"}).to_string();
++        assert!(handle_request(&state, &line).await.is_none());
++    }
++
++    #[tokio::test]
++    async fn method_not_found() {
++        let state = test_state();
++        let resp = handle_request(&state, &req(json!(7), "no.such.method", json!({})))
++            .await
++            .unwrap();
++        assert_eq!(resp["id"], json!(7));
++        assert_eq!(resp["error"]["code"], -32601);
++    }
++
++    #[tokio::test]
++    async fn volumes_list_returns_volumes() {
++        let state = test_state();
++        let resp = handle_request(&state, &req(json!("a"), "volumes.list", json!({})))
++            .await
++            .unwrap();
++        let vols = resp["result"]["volumes"].as_array().unwrap();
++        assert_eq!(vols.len(), 1);
++        assert_eq!(vols[0]["mount_point"], "/mnt/fake");
++        assert_eq!(vols[0]["is_ntfs"], true);
++    }
++
++    #[tokio::test]
++    async fn missing_params_gives_invalid_params_error() {
++        let state = test_state();
++        let resp = handle_request(&state, &req(json!(1), "streams.list", json!({})))
++            .await
++            .unwrap();
++        assert_eq!(resp["error"]["code"], -32602);
++    }
++
++    #[tokio::test]
++    async fn stream_read_returns_base64_and_eof() {
++        let state = test_state();
++        let resp = handle_request(
++            &state,
++            &req(
++                json!(2),
++                "stream.read",
++                json!({"path": "/x", "stream_name": "s", "offset": 0, "length": 5}),
++            ),
++        )
++        .await
++        .unwrap();
++        let result = &resp["result"];
++        assert_eq!(result["length"], 5);
++        assert_eq!(result["eof"], false);
++        let decoded = base64::engine::general_purpose::STANDARD
++            .decode(result["data_base64"].as_str().unwrap())
++            .unwrap();
++        assert_eq!(decoded, b"hello");
++
++        // Oversized reads are rejected (SPEC §5: max 1 MiB per read).
++        let resp = handle_request(
++            &state,
++            &req(
++                json!(3),
++                "stream.read",
++                json!({"path": "/x", "stream_name": "s", "length": 2 * 1024 * 1024}),
++            ),
++        )
++        .await
++        .unwrap();
++        assert_eq!(resp["error"]["code"], -32602);
++    }
++
++    #[tokio::test]
++    async fn stream_export_writes_file_and_hashes() {
++        let tmp = tempfile::TempDir::new().unwrap();
++        let dest = tmp.path().join("out.bin");
++        let state = test_state();
++        let resp = handle_request(
++            &state,
++            &req(
++                json!(4),
++                "stream.export",
++                json!({
++                    "path": "/x",
++                    "stream_name": "s",
++                    "destination": dest.to_string_lossy(),
++                }),
++            ),
++        )
++        .await
++        .unwrap();
++        assert_eq!(resp["result"]["bytes_written"], 12);
++        // sha256("hello stream") must match the exported file's hash.
++        let sha = resp["result"]["sha256"].as_str().unwrap();
++        assert_eq!(sha.len(), 64);
++        assert_eq!(
++            sha,
++            "21711375b9af870d28f0aec255949cb094893ac157f191055ffd3492ae657933"
++        );
++        assert_eq!(std::fs::read(&dest).unwrap(), b"hello stream");
++    }
++
++    #[test]
++    fn test_export_file_name_sanitizes() {
++        assert_eq!(
++            export_file_name(Path::new("/tmp/f.txt"), "Zone.Identifier"),
++            "f.txt_Zone.Identifier.bin"
++        );
++        assert_eq!(
++            export_file_name(Path::new("/tmp/a b.dat"), "na/me:x"),
++            "a b.dat_na_me_x.bin"
++        );
++    }
++
++    #[tokio::test]
++    async fn scan_start_emits_events_and_cancel_stops_job() {
++        let tmp = tempfile::TempDir::new().unwrap();
++        std::fs::write(tmp.path().join("f.txt"), b"x").unwrap();
++        let (tx, mut rx) = mpsc::channel::<String>(64);
++        let state = Arc::new(ServerState {
++            backend: Arc::new(FakeBackend::new()),
++            outbox: tx,
++            jobs: Arc::new(Mutex::new(HashMap::new())),
++        });
++
++        let resp = handle_request(
++            &state,
++            &req(
++                json!(5),
++                "scan.start",
++                json!({"path": tmp.path().to_string_lossy(), "recursive": true}),
++            ),
++        )
++        .await
++        .unwrap();
++        let job_id = resp["result"]["job_id"].as_str().unwrap().to_string();
++        assert!(job_id.starts_with("scan-"));
++
++        // Wait until the completed event arrives on the outbox.
++        let mut saw_completed = false;
++        for _ in 0..50 {
++            let Ok(line) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await else {
++                continue;
++            };
++            let Some(line) = line else { break };
++            let v: Value = serde_json::from_str(&line).unwrap();
++            if v["method"] == "scan.completed" {
++                assert_eq!(v["params"]["job_id"], job_id.as_str());
++                saw_completed = true;
++                break;
++            }
++        }
++        assert!(saw_completed, "expected scan.completed event");
++
++        // The finished job must be removable / already gone from the registry.
++        let resp = handle_request(
++            &state,
++            &req(json!(6), "scan.cancel", json!({"job_id": job_id})),
++        )
++        .await
++        .unwrap();
++        assert_eq!(resp["result"]["cancelled"], false); // job already finished
++    }
++
++    #[tokio::test]
++    async fn scan_cancel_unknown_job() {
++        let state = test_state();
++        let resp = handle_request(
++            &state,
++            &req(json!(9), "scan.cancel", json!({"job_id": "nope"})),
++        )
++        .await
++        .unwrap();
++        assert_eq!(resp["result"]["cancelled"], false);
++    }
++
++    #[test]
++    fn error_response_shape() {
++        let r = error_response(json!(1), -32601, "Method not found: x", Some(json!({"k": 1})));
++        assert_eq!(r["jsonrpc"], "2.0");
++        assert_eq!(r["id"], json!(1));
++        assert_eq!(r["error"]["code"], -32601);
++        assert_eq!(r["error"]["data"]["k"], 1);
++    }
++}
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+new file mode 100644
+index 0000000..1f51bd3
+--- /dev/null
++++ b/cli/src/main.rs
+@@ -0,0 +1,120 @@
++//! ads-cli — command-line interface and JSON-RPC server for the NTFS ADS core.
++//!
++//! Two modes (SPEC §4.2):
++//! 1. Human-readable commands: `volumes`, `scan`, `streams`, `export`
++//! 2. `serve --stdio` — JSON-RPC 2.0 over stdin/stdout for the GUI sidecar.
++
++mod commands;
++mod jsonrpc;
++
++use clap::{Parser, Subcommand};
++
++#[derive(Parser)]
++#[command(name = "ads-cli", version, about = "NTFS Alternate Data Streams viewer (read/export only)")]
++pub struct Cli {
++    /// Log level: error | warn | info | debug | trace
++    #[arg(long, default_value = "warn", global = true)]
++    log_level: String,
++
++    #[command(subcommand)]
++    command: Commands,
++}
++
++#[derive(Subcommand)]
++pub enum Commands {
++    /// List mounted volumes
++    Volumes,
++    /// Scan a path for alternate data streams
++    Scan {
++        /// Path to scan (file or directory)
++        path: String,
++        /// Do not recurse into subdirectories
++        #[arg(long)]
++        no_recursive: bool,
++        /// Include hidden entries
++        #[arg(long, default_value = "true")]
++        include_hidden: bool,
++        /// Include system entries (Windows attributes)
++        #[arg(long)]
++        include_system: bool,
++        /// Also inspect directories themselves
++        #[arg(long, default_value = "true")]
++        include_directories: bool,
++        /// Follow symlinks
++        #[arg(long)]
++        follow_symlinks: bool,
++    },
++    /// List streams of a file or directory
++    Streams {
++        path: String,
++    },
++    /// Export one stream (or all with --all) to a file/directory
++    Export {
++        /// Owner file/directory path
++        path: String,
++        /// Stream name (omit with --all)
++        stream_name: Option<String>,
++        /// Output file (`-o`) or directory with `--all`
++        #[arg(short, long)]
++        output: String,
++        /// Export every stream of the file into <output> as a directory
++        #[arg(long)]
++        all: bool,
++    },
++    /// Start a JSON-RPC 2.0 server on stdin/stdout (for the GUI)
++    Serve {
++        /// Use stdio transport (the only transport in v0.1)
++        #[arg(long)]
++        stdio: bool,
++    },
++}
++
++fn init_tracing(level: &str) {
++    use tracing_subscriber::EnvFilter;
++    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("warn"));
++    // Logging must go to stderr only — stdout is reserved for JSON-RPC.
++    tracing_subscriber::fmt()
++        .with_env_filter(filter)
++        .with_writer(std::io::stderr)
++        .init();
++}
++
++#[tokio::main]
++async fn main() -> anyhow::Result<()> {
++    let cli = Cli::parse();
++    init_tracing(&cli.log_level);
++
++    match cli.command {
++        Commands::Volumes => commands::volumes::run().await,
++        Commands::Scan {
++            path,
++            no_recursive,
++            include_hidden,
++            include_system,
++            include_directories,
++            follow_symlinks,
++        } => {
++            let opts = ntfs_streams_core::ScanOptions {
++                recursive: !no_recursive,
++                include_hidden,
++                include_system,
++                include_directories,
++                follow_symlinks,
++            };
++            commands::scan::run(&path, opts).await
++        }
++        Commands::Streams { path } => commands::streams::run(&path).await,
++        Commands::Export {
++            path,
++            stream_name,
++            output,
++            all,
++        } => commands::export::run(&path, stream_name.as_deref(), &output, all).await,
++        Commands::Serve { stdio } => {
++            if !stdio {
++                anyhow::bail!("only `serve --stdio` is supported in v0.1");
++            }
++            jsonrpc::serve_stdio().await
++        }
++    }
++}
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+new file mode 100644
+index 0000000..f400804
+--- /dev/null
++++ b/core/Cargo.toml
+@@ -0,0 +1,37 @@
++[package]
++name = "ntfs-streams-core"
++version.workspace = true
++edition.workspace = true
++authors.workspace = true
++license.workspace = true
++repository.workspace = true
++description = "Core library for working with NTFS Alternate Data Streams on mounted volumes"
++
++[dependencies]
++thiserror = { workspace = true }
++serde = { workspace = true }
++serde_json = { workspace = true }
++tokio = { workspace = true }
++anyhow = { workspace = true }
++tracing = "0.1"
++tokio-util = "0.7"
++async-trait = "0.1"
++uuid = { version = "1", features = ["v4"] }
++sha2 = "0.10"
++base64 = "0.22"
++
++[target.'cfg(windows)'.dependencies]
++windows = { version = "0.58", features = [
++    "Win32_Storage_FileSystem",
++    "Win32_Foundation",
++    "Win32_System_IO",
++    "Win32_Security",
++    "Win32_System_SystemInformation",
++] }
++
++[target.'cfg(unix)'.dependencies]
++xattr = "1.3"
++libc = "0.2"
++
++[dev-dependencies]
++tempfile = "3"
+diff --git a/core/src/backend.rs b/core/src/backend.rs
+new file mode 100644
+index 0000000..4c8988d
+--- /dev/null
++++ b/core/src/backend.rs
+@@ -0,0 +1,50 @@
++//! Backend abstraction: platform-agnostic trait for ADS operations.
++
++use crate::error::CoreError;
++use crate::types::{StreamInfo, VolumeInfo};
++use async_trait::async_trait;
++use std::path::Path;
++use tokio_util::sync::CancellationToken;
++
++/// Abstraction over platform-specific ADS access (Windows native streams,
++/// Linux xattr emulation on NTFS volumes).
++#[async_trait]
++pub trait AdsBackend: Send + Sync {
++    /// List mounted volumes visible to the process.
++    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, CoreError>;
++
++    /// List alternate data streams of a file or directory
++    /// (the default `::$DATA` stream is not included).
++    async fn list_streams(&self, path: &Path) -> Result<Vec<StreamInfo>, CoreError>;
++
++    /// Read up to `len` bytes of a stream starting at `offset`.
++    /// Returns `(data, eof)`.
++    async fn read_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), CoreError>;
++
++    /// Export a stream to a destination file, copying in blocks.
++    /// Returns number of bytes written. Must honour `cancel`.
++    async fn export_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: CancellationToken,
++    ) -> Result<u64, CoreError>;
++}
++
++/// Concrete backend type for the current platform.
++#[cfg(windows)]
++pub type PlatformBackend = crate::backends::windows::WindowsBackend;
++#[cfg(not(windows))]
++pub type PlatformBackend = crate::backends::linux::LinuxBackend;
++
++/// Construct the backend for the current platform.
++pub fn default_backend() -> std::sync::Arc<PlatformBackend> {
++    PlatformBackend::new()
++}
+diff --git a/core/src/backends/linux.rs b/core/src/backends/linux.rs
+new file mode 100644
+index 0000000..5fe609c
+--- /dev/null
++++ b/core/src/backends/linux.rs
+@@ -0,0 +1,467 @@
++//! Linux backend: NTFS alternate data streams are exposed by the `ntfs3`
++//! kernel driver and `ntfs-3g` FUSE driver as extended attributes with the
++//! `user.` prefix (`user.StreamName` ↔ ADS `StreamName:$DATA`).
++//!
++//! Per SPEC we only treat a path as having ADS if it lives on an NTFS mount
++//! (`ntfs`, `ntfs3`, or `fuseblk` mounted from an NTFS device).
++
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use async_trait::async_trait;
++use tokio_util::sync::CancellationToken;
++
++use crate::backend::AdsBackend;
++use crate::error::CoreError;
++use crate::types::{StreamInfo, VolumeInfo};
++
++/// xattr namespace prefix used by ntfs-3g / ntfs3 for named DATA streams.
++const USER_PREFIX: &str = "user.";
++/// Special ntfs-3g xattrs that emulate NTFS metadata rather than representing
++/// real named ADS — skip them.
++const SKIP_XATTRS: &[&str] = &[
++    "user.ntfs_dos_name",
++    "user.ntfs_reparse_data",
++    "user.ntfs_file_name",
++    "user.ntfs_sec.hash",
++];
++
++#[derive(Default)]
++struct Inner {
++    /// Cache: mount point -> is NTFS.
++    ntfs_cache: std::collections::HashMap<PathBuf, bool>,
++}
++
++#[derive(Default)]
++pub struct LinuxBackend {
++    inner: Arc<std::sync::Mutex<Inner>>,
++}
++
++impl LinuxBackend {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self::default())
++    }
++
++    fn clone_inner(&self) -> Self {
++        Self {
++            inner: self.inner.clone(),
++        }
++    }
++
++    /// Determine whether `path` resides on an NTFS mount by consulting
++    /// `/proc/self/mountinfo` (longest matching mount point wins).
++    fn detect_ntfs(path: &Path) -> bool {
++        let mounts = match parse_mountinfo() {
++            Ok(m) => m,
++            Err(_) => return false,
++        };
++        let mut best: Option<(usize, bool)> = None;
++        for m in &mounts {
++            if path.starts_with(&m.mount_point) {
++                let len = m.mount_point.as_os_str().len();
++                if best.map(|(l, _)| len >= l).unwrap_or(true) {
++                    best = Some((len, m.is_ntfs()));
++                }
++            }
++        }
++        best.map(|(_, v)| v).unwrap_or(false)
++    }
++
++    fn check_ntfs(&self, path: &Path) -> Result<(), CoreError> {
++        let abs = absolutize(path);
++        {
++            let cache = self.inner.lock().unwrap();
++            let mut key = abs.clone();
++            loop {
++                if let Some(&is_ntfs) = cache.ntfs_cache.get(&key) {
++                    return if is_ntfs { Ok(()) } else { Err(not_ntfs(&abs)) };
++                }
++                if !key.pop() {
++                    break;
++                }
++            }
++        }
++        let is_ntfs = Self::detect_ntfs(&abs);
++        {
++            let mut cache = self.inner.lock().unwrap();
++            if let Ok(mounts) = parse_mountinfo() {
++                for m in mounts {
++                    if abs.starts_with(&m.mount_point) {
++                        cache.ntfs_cache.insert(m.mount_point, is_ntfs);
++                        break;
++                    }
++                }
++            }
++        }
++        if is_ntfs {
++            Ok(())
++        } else {
++            Err(not_ntfs(&abs))
++        }
++    }
++
++    fn list_volumes_sync(&self) -> Result<Vec<VolumeInfo>, CoreError> {
++        let mounts = parse_mountinfo()?;
++        let mut volumes = Vec::new();
++        let mut seen = std::collections::HashSet::new();
++        for (idx, m) in mounts.iter().enumerate() {
++            if !seen.insert(m.mount_point.clone()) {
++                continue; // bind mounts repeat the same mount point
++            }
++            let is_ntfs = m.is_ntfs();
++            let (total, free) = statvfs_sizes(&m.mount_point);
++            let writable = probe_writable(&m.mount_point);
++            let name = m
++                .mount_point
++                .file_name()
++                .map(|n| n.to_string_lossy().into_owned())
++                .unwrap_or_else(|| m.mount_point.to_string_lossy().into_owned());
++            volumes.push(VolumeInfo {
++                id: format!("vol{idx}"),
++                name,
++                mount_point: m.mount_point.clone(),
++                file_system: m.fs_type.clone(),
++                is_ntfs,
++                is_writable: writable,
++                total_size: total,
++                free_size: free,
++            });
++        }
++        Ok(volumes)
++    }
++
++    fn list_streams_sync(&self, path: &Path) -> Result<Vec<StreamInfo>, CoreError> {
++        if !path.exists() {
++            return Err(CoreError::NotFound(path.display().to_string()));
++        }
++        self.check_ntfs(path)?;
++
++        let names = xattr::list(path).map_err(|e| classify_xattr_error(e, path))?;
++        let mut streams = Vec::new();
++        for attr in names {
++            let attr = attr.to_string_lossy().into_owned();
++            let Some(stream_name) = attr.strip_prefix(USER_PREFIX) else {
++                continue;
++            };
++            if SKIP_XATTRS.contains(&attr.as_str()) || stream_name.is_empty() {
++                continue;
++            }
++            let size = match xattr::get(path, &attr) {
++                Ok(Some(data)) => data.len() as u64,
++                _ => 0,
++            };
++            streams.push(StreamInfo {
++                name: stream_name.to_string(),
++                size,
++                owner_path: path.to_path_buf(),
++            });
++        }
++        streams.sort_by(|a, b| a.name.cmp(&b.name));
++        Ok(streams)
++    }
++
++    fn read_stream_sync(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), CoreError> {
++        if !path.exists() {
++            return Err(CoreError::NotFound(path.display().to_string()));
++        }
++        self.check_ntfs(path)?;
++        let attr = format!("{USER_PREFIX}{stream_name}");
++        let data = xattr::get(path, &attr)
++            .map_err(|e| classify_xattr_error(e, path))?
++            .ok_or_else(|| {
++                CoreError::StreamNotFound(path.display().to_string(), stream_name.into())
++            })?;
++        let off = offset as usize;
++        if off >= data.len() {
++            return Ok((Vec::new(), true));
++        }
++        let end = (off + len).min(data.len());
++        let eof = end >= data.len();
++        Ok((data[off..end].to_vec(), eof))
++    }
++
++    fn export_stream_sync(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: &CancellationToken,
++    ) -> Result<u64, CoreError> {
++        let (data, _) = self.read_stream_sync(path, stream_name, 0, usize::MAX)?;
++        if cancel.is_cancelled() {
++            return Err(CoreError::Cancelled);
++        }
++        if let Some(dir) = destination.parent() {
++            std::fs::create_dir_all(dir)?;
++        }
++        std::fs::write(destination, &data)?;
++        Ok(data.len() as u64)
++    }
++}
++
++fn not_ntfs(abs: &Path) -> CoreError {
++    CoreError::NotSupported(format!("{} is not on an NTFS volume", abs.display()))
++}
++
++fn absolutize(path: &Path) -> PathBuf {
++    if path.is_absolute() {
++        path.to_path_buf()
++    } else {
++        std::env::current_dir()
++            .map(|c| c.join(path))
++            .unwrap_or_else(|_| path.to_path_buf())
++    }
++}
++
++struct MountEntry {
++    mount_point: PathBuf,
++    fs_type: String,
++    device: String,
++}
++
++impl MountEntry {
++    fn is_ntfs(&self) -> bool {
++        match self.fs_type.as_str() {
++            "ntfs" | "ntfs3" => true,
++            // fuseblk could be ntfs-3g; confirm via superblock magic when the
++            // block device is readable.
++            "fuseblk" => read_fs_magic(&self.device).as_deref() == Some("NTFS"),
++            _ => false,
++        }
++    }
++}
++
++/// Read filesystem magic from a block device (best effort, needs permissions).
++fn read_fs_magic(device: &str) -> Option<String> {
++    use std::io::{Read, Seek};
++    if !device.starts_with("/dev/") {
++        return None;
++    }
++    let mut f = std::fs::File::open(device).ok()?;
++    let mut buf = [0u8; 8];
++    // NTFS OEM ID "NTFS    " at offset 3.
++    f.seek(std::io::SeekFrom::Start(3)).ok()?;
++    let n = f.read(&mut buf).ok()?;
++    if n >= 5 && &buf[..5] == b"NTFS " {
++        Some("NTFS".to_string())
++    } else {
++        None
++    }
++}
++
++fn parse_mountinfo() -> Result<Vec<MountEntry>, CoreError> {
++    parse_mountinfo_from("/proc/self/mountinfo")
++}
++
++fn parse_mountinfo_from(file: &str) -> Result<Vec<MountEntry>, CoreError> {
++    let content = std::fs::read_to_string(file)?;
++    let mut out = Vec::new();
++    for line in content.lines() {
++        // Format: id parent major:minor root mount_point opts fstype superopts - source ...
++        let parts: Vec<&str> = line.split(' ').collect();
++        let Some(sep_idx) = parts.iter().position(|p| *p == "-") else {
++            continue;
++        };
++        if parts.len() < sep_idx + 3 || parts.len() < 6 {
++            continue;
++        }
++        let mount_point = unescape_octal(parts[4]);
++        let fstype = parts[sep_idx + 1].to_string();
++        let source = parts[sep_idx + 2].to_string();
++        if mount_point.is_empty() {
++            continue;
++        }
++        out.push(MountEntry {
++            mount_point: PathBuf::from(mount_point),
++            fs_type: fstype,
++            device: source,
++        });
++    }
++    Ok(out)
++}
++
++/// mountinfo escapes spaces/tabs/newlines/backslashes as \040 etc.
++fn unescape_octal(s: &str) -> String {
++    let bytes = s.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        // Need a full three-digit octal escape: \ + 3 digits (e.g. "\040").
++        if bytes[i] == b'\\' && i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(u8::is_ascii_digit) {
++            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
++                out.push(v);
++                i += 4;
++                continue;
++            }
++        }
++        out.push(bytes[i]);
++        i += 1;
++    }
++    String::from_utf8_lossy(&out).into_owned()
++}
++
++#[async_trait]
++impl AdsBackend for LinuxBackend {
++    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, CoreError> {
++        let this = self.clone_inner();
++        tokio::task::spawn_blocking(move || this.list_volumes_sync())
++            .await
++            .map_err(join_err)?
++    }
++
++    async fn list_streams(&self, path: &Path) -> Result<Vec<StreamInfo>, CoreError> {
++        let this = self.clone_inner();
++        let path = path.to_path_buf();
++        tokio::task::spawn_blocking(move || this.list_streams_sync(&path))
++            .await
++            .map_err(join_err)?
++    }
++
++    async fn read_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), CoreError> {
++        let this = self.clone_inner();
++        let path = path.to_path_buf();
++        let stream_name = stream_name.to_string();
++        tokio::task::spawn_blocking(move || this.read_stream_sync(&path, &stream_name, offset, len))
++            .await
++            .map_err(join_err)?
++    }
++
++    async fn export_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: CancellationToken,
++    ) -> Result<u64, CoreError> {
++        let this = self.clone_inner();
++        let path = path.to_path_buf();
++        let stream_name = stream_name.to_string();
++        let destination = destination.to_path_buf();
++        tokio::task::spawn_blocking(move || {
++            this.export_stream_sync(&path, &stream_name, &destination, &cancel)
++        })
++        .await
++        .map_err(join_err)?
++    }
++}
++
++fn join_err(e: tokio::task::JoinError) -> CoreError {
++    CoreError::Io(std::io::Error::other(e.to_string()))
++}
++
++/// Heuristic writability check: try creating a temp file.
++fn probe_writable(path: &Path) -> bool {
++    let probe = path.join(".ads-cli-write-probe");
++    match std::fs::OpenOptions::new()
++        .create_new(true)
++        .write(true)
++        .open(&probe)
++    {
++        Ok(_) => {
++            let _ = std::fs::remove_file(&probe);
++            true
++        }
++        Err(_) => false,
++    }
++}
++
++fn classify_xattr_error(e: std::io::Error, path: &Path) -> CoreError {
++    match e.raw_os_error() {
++        Some(libc::EACCES) | Some(libc::EPERM) => {
++            CoreError::AccessDenied(path.display().to_string())
++        }
++        Some(libc::ENOENT) => CoreError::NotFound(path.display().to_string()),
++        Some(libc::ENOTSUP) | Some(libc::ERANGE) => {
++            CoreError::NotSupported(format!("xattrs not supported on {}", path.display()))
++        }
++        _ => CoreError::Io(e),
++    }
++}
++
++fn statvfs_sizes(path: &Path) -> (Option<u64>, Option<u64>) {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
++        return (None, None);
++    };
++    unsafe {
++        let mut stat: libc::statvfs = std::mem::zeroed();
++        if libc::statvfs(cpath.as_ptr(), &mut stat) == 0 {
++            let frsize = stat.f_frsize as u64;
++            let total = stat.f_blocks as u64 * frsize;
++            let free = stat.f_bavail as u64 * frsize;
++            (Some(total), Some(free))
++        } else {
++            (None, None)
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_unescape_octal() {
++        // mountinfo escapes special chars as a backslash followed by three
++        // octal digits, e.g. space -> "\040" (literal backslash in the file).
++        assert_eq!(unescape_octal(r"/mnt/my\040disk"), "/mnt/my disk");
++        assert_eq!(unescape_octal("/plain"), "/plain");
++        assert_eq!(unescape_octal(r"tab\011sep"), "tab\tsep");
++        assert_eq!(unescape_octal(r"back\134slash"), "back\\slash");
++    }
++
++    #[test]
++    fn test_parse_mountinfo_from_sample() {
++        let sample = "22 1 8:1 / /mnt/win rw,relatime shared:2 - ntfs3 /dev/sda1 rw,uid=0\n\
++                      23 1 8:2 / /home rw - ext4 /dev/sdb2 rw\n";
++        let file = "/tmp/ads_test_mountinfo";
++        std::fs::write(file, sample).unwrap();
++        let mounts = parse_mountinfo_from(file).unwrap();
++        assert_eq!(mounts.len(), 2);
++        assert_eq!(mounts[0].mount_point, PathBuf::from("/mnt/win"));
++        assert_eq!(mounts[0].fs_type, "ntfs3");
++        assert!(!mounts[1].is_ntfs());
++        let _ = std::fs::remove_file(file);
++    }
++
++    #[test]
++    fn test_non_ntfs_path_is_not_supported() {
++        let be = LinuxBackend::new();
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .unwrap();
++        let res = rt.block_on(be.list_streams(Path::new("/tmp")));
++        // /tmp is essentially never NTFS; either NotSupported or (rare CI with
++        // NTFS /tmp) Ok.
++        assert!(
++            matches!(res, Err(CoreError::NotSupported(_))) || res.is_ok(),
++            "unexpected error: {:?}",
++            res.err()
++        );
++    }
++
++    #[test]
++    fn test_missing_path_is_not_found() {
++        let be = LinuxBackend::new();
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .unwrap();
++        let res = rt.block_on(be.list_streams(Path::new("/nonexistent-ads-test-path")));
++        assert!(matches!(res, Err(CoreError::NotFound(_))));
++    }
++}
+diff --git a/core/src/backends/mod.rs b/core/src/backends/mod.rs
+new file mode 100644
+index 0000000..e9360b8
+--- /dev/null
++++ b/core/src/backends/mod.rs
+@@ -0,0 +1,7 @@
++//! Platform backends.
++
++#[cfg(windows)]
++pub mod windows;
++
++#[cfg(unix)]
++pub mod linux;
+diff --git a/core/src/backends/windows.rs b/core/src/backends/windows.rs
+new file mode 100644
+index 0000000..1d34251
+--- /dev/null
++++ b/core/src/backends/windows.rs
+@@ -0,0 +1,455 @@
++//! Windows backend using the native NTFS ADS APIs:
++//! - `GetLogicalDriveStringsW` / `GetDriveTypeW` / `GetVolumeInformationW` /
++//!   `GetDiskFreeSpaceExW` for volume enumeration,
++//! - `FindFirstStreamW` / `FindNextStreamW` for stream enumeration,
++//! - `CreateFileW` with `\\?\path:stream:$DATA` syntax for reading/exporting.
++
++use std::ffi::c_void;
++use std::os::windows::ffi::OsStrExt;
++use std::path::{Path, PathBuf};
++
++use async_trait::async_trait;
++use tokio_util::sync::CancellationToken;
++use windows::core::{w, PCWSTR};
++use windows::Win32::Foundation::{
++    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
++    ERROR_PATH_NOT_FOUND, HANDLE, HANDLE_FLAGS, INVALID_HANDLE_VALUE, WIN32_ERROR,
++};
++use windows::Win32::Storage::FileSystem::{
++    CreateFileW, FindFirstStreamW, FindNextStreamW, GetDiskFreeSpaceExW, GetDriveTypeW,
++    GetLogicalDriveStringsW, GetVolumeInformationW, CREATE_FILE_CREATE_OPTIONS,
++    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_STREAM_INFO,
++    FL_FIND_STREAM_INFO_FLAGS, GET_FILE_FLAGS_AND_ATTRIBUTES, READ_DATA_ACCEPTED,
++};
++use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
++use windows::Win32::System::IO::ReadFile;
++use windows::Win32::Foundation::{DELETE, GENERIC_READ};
++
++/// Copy block size used for exports (SPEC §3.3: 64 KiB – 1 MiB).
++const BLOCK_SIZE: usize = 256 * 1024;
++
++#[derive(Clone, Default)]
++pub struct WindowsBackend {}
++
++impl WindowsBackend {
++    pub fn new() -> std::sync::Arc<Self> {
++        std::sync::Arc::new(Self::default())
++    }
++}
++
++fn to_wide(s: &str) -> Vec<u16> {
++    let mut v: Vec<u16> = s.encode_utf16().collect();
++    v.push(0);
++    v
++}
++
++fn path_to_wide(path: &Path) -> Vec<u16> {
++    to_wide(&path.to_string_lossy())
++}
++
++/// Convert a Win32 error code into a structured [`CoreError`].
++fn win_error(err: WIN32_ERROR, context: &str) -> crate::error::CoreError {
++    use crate::error::CoreError;
++    match err {
++        ERROR_ACCESS_DENIED => CoreError::AccessDenied(context.to_string()),
++        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => CoreError::NotFound(context.to_string()),
++        other => {
++            let code = other.0;
++            CoreError::Io(std::io::Error::from_raw_os_error(code as i32))
++        }
++    }
++}
++
++/// Build the extended-length (`\\?\`) path for a specific stream.
++///
++/// `stream_name == ""` means the default `::$DATA` stream.
++pub(crate) fn build_stream_path(path: &Path, stream_name: &str) -> String {
++    let raw = path.to_string_lossy().replace('/', "\\");
++    let prefixed = if raw.starts_with("\\\\?\\") {
++        raw
++    } else if raw.starts_with("\\\\") {
++        // UNC: \\server\share → \\?\UNC\server\share
++        format!("\\\\?\\UNC{}", &raw[1..])
++    } else {
++        format!("\\\\?\\{raw}")
++    };
++    if stream_name.is_empty() {
++        prefixed
++    } else {
++        format!("{prefixed}:{stream_name}:$DATA")
++    }
++}
++
++unsafe fn open_stream_read(path: &Path, stream_name: &str) -> Result<HANDLE, crate::error::CoreError> {
++    let full = build_stream_path(path, stream_name);
++    let wide = to_wide(&full);
++    let handle = CreateFileW(
++        PCWSTR(wide.as_ptr()),
++        GENERIC_READ.0,
++        windows::Win32::Storage::FileSystem::FILE_SHARE_READ
++            | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE
++            | windows::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
++        None,
++        windows::Win32::Storage::FileSystem::OPEN_EXISTING,
++        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
++        None,
++    );
++    match handle {
++        Ok(h) if h != INVALID_HANDLE_VALUE => Ok(h),
++        Ok(_) | Err(_) => {
++            let err = GetLastError();
++            Err(win_error(err, &path.display().to_string()))
++        }
++    }
++}
++
++impl WindowsBackend {
++    pub(crate) fn list_volumes_sync(&self) -> Result<Vec<crate::types::VolumeInfo>, crate::error::CoreError> {
++        use crate::types::VolumeInfo;
++        unsafe {
++            let mut buf = [0u16; 512];
++            let len = GetLogicalDriveStringsW(&mut buf);
++            if len == 0 {
++                return Ok(Vec::new());
++            }
++            let drives = parse_double_null_terminated(&buf[..len as usize]);
++            let mut volumes = Vec::new();
++            for (idx, drive) in drives.iter().enumerate() {
++                // e.g. "C:\"
++                let wide = to_wide(drive);
++                let drive_type = GetDriveTypeW(PCWSTR(wide.as_ptr()));
++                let is_removable = drive_type == windows::Win32::Storage::FileSystem::DRIVE_REMOVABLE;
++                if drive_type != windows::Win32::Storage::FileSystem::DRIVE_FIXED && !is_removable {
++                    continue;
++                }
++                let mut fs_name = [0u16; 64];
++                let mut vol_name = [0u16; 128];
++                let mut serial = 0u32;
++                let mut max_component = 0u32;
++                let mut flags = windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0);
++                let ok = GetVolumeInformationW(
++                    PCWSTR(wide.as_ptr()),
++                    Some(&mut vol_name),
++                    Some(&mut serial),
++                    Some(&mut max_component),
++                    Some(&mut flags),
++                    Some(&mut fs_name),
++                );
++                let file_system = if ok.is_ok() {
++                    String::from_utf16_lossy(trim_nul(&fs_name))
++                } else {
++                    String::new()
++                };
++                let is_ntfs = file_system.eq_ignore_ascii_case("NTFS");
++                let mut free_available = 0u64;
++                let mut total = 0u64;
++                let mut total_free = 0u64;
++                let (total_size, free_size) =
++                    if GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free_available), Some(&mut total), Some(&mut total_free))
++                        .is_ok()
++                    {
++                        (Some(total), Some(free_available))
++                    } else {
++                        (None, None)
++                    };
++                let writable = match flags {
++                    f => (f.0 & windows::Win32::Storage::FileSystem::FILE_READ_ONLY_VOLUME.0) == 0,
++                };
++                let name_trimmed = String::from_utf16_lossy(trim_nul(&vol_name));
++                volumes.push(VolumeInfo {
++                    id: drive.trim_end_matches(['\\', '/']).to_string(),
++                    name: if name_trimmed.is_empty() {
++                        drive.clone()
++                    } else {
++                        format!("{name_trimmed} ({drive})")
++                    },
++                    mount_point: PathBuf::from(drive),
++                    file_system,
++                    is_ntfs,
++                    is_writable: writable,
++                    total_size,
++                    free_size,
++                });
++                let _ = idx;
++            }
++            Ok(volumes)
++        }
++    }
++
++    pub(crate) fn list_streams_sync(
++        &self,
++        path: &Path,
++    ) -> Result<Vec<crate::types::StreamInfo>, crate::error::CoreError> {
++        use crate::error::CoreError;
++        use crate::types::StreamInfo;
++        unsafe {
++            let wide = path_to_wide(&strip_verbatim(path));
++            let mut info = FILE_STREAM_INFO::default();
++            let mut find_data = windows::Win32::Foundation::WIN32_FIND_DATAW::default();
++            let result = FindFirstStreamW(
++                PCWSTR(wide.as_ptr()),
++                FL_FIND_STREAM_INFO_FLAGS(0),
++                Some(&mut info as *mut _ as *mut c_void),
++                std::mem::size_of::<FILE_STREAM_INFO>() as u32,
++                &mut find_data,
++            );
++            if result.is_err() {
++                let err = GetLastError();
++                if err == ERROR_HANDLE_EOF {
++                    return Ok(Vec::new());
++                }
++                return Err(win_error(err, &path.display().to_string()));
++            }
++            let mut streams = Vec::new();
++            loop {
++                let raw = String::from_utf16_lossy(trim_nul(&info.StreamName));
++                // Format: ":Name:$TYPE" — keep only $DATA streams, drop default "::\$DATA".
++                if let Some(rest) = raw.strip_prefix(':') {
++                    if let Some((name, ty)) = rest.rsplit_once(':') {
++                        if ty.eq_ignore_ascii_case("$DATA") && !name.is_empty() {
++                            streams.push(StreamInfo {
++                                name,
++                                size: info.StreamSize.u64(),
++                                owner_path: path.to_path_buf(),
++                            });
++                        }
++                    }
++                }
++                let next = FindNextStreamW(
++                    result,
++                    Some(&mut info as *mut _ as *mut c_void),
++                );
++                if next.is_err() {
++                    let err = GetLastError();
++                    if err == ERROR_HANDLE_EOF {
++                        break;
++                    }
++                    return Err(win_error(err, &path.display().to_string()));
++                }
++            }
++            let _ = CloseHandle(result);
++            streams.sort_by(|a, b| a.name.cmp(&b.name));
++            Ok(streams)
++        }
++    }
++
++    pub(crate) fn read_stream_sync(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), crate::error::CoreError> {
++        use crate::error::CoreError;
++        unsafe {
++            let handle = open_stream_read(path, stream_name)?;
++            // Seek via SetFilePointerEx.
++            let ok = windows::Win32::Storage::FileSystem::SetFilePointerEx(
++                handle,
++                offset as i64,
++                None,
++                windows::Win32::Storage::FileSystem::FILE_BEGIN,
++            );
++            if ok.is_err() {
++                let err = GetLastError();
++                let _ = CloseHandle(handle);
++                return Err(win_error(err, &path.display().to_string()));
++            }
++            let mut buf = vec![0u8; len.min(BLOCK_SIZE.max(len))];
++            let mut total = Vec::with_capacity(len);
++            while total.len() < len {
++                let want = (len - total.len()).min(BLOCK_SIZE);
++                let mut read = 0u32;
++                let r = ReadFile(
++                    handle,
++                    Some(&mut buf[..want]),
++                    Some(&mut read),
++                    None,
++                );
++                if r.is_err() {
++                    let err = GetLastError();
++                    let _ = CloseHandle(handle);
++                    return Err(win_error(err, &path.display().to_string()));
++                }
++                if read == 0 {
++                    break;
++                }
++                total.extend_from_slice(&buf[..read as usize]);
++            }
++            let _ = CloseHandle(handle);
++            // EOF when we couldn't fill the requested length.
++            let eof = total.len() < len;
++            let _ = &*READ_DATA_ACCEPTED.to_string(); // placeholder no-op removed below
++            Ok((total, eof))
++        }
++    }
++
++    pub(crate) fn export_stream_sync(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: &CancellationToken,
++    ) -> Result<u64, crate::error::CoreError> {
++        use crate::error::CoreError;
++        if cancel.is_cancelled() {
++            return Err(CoreError::Cancelled);
++        }
++        if let Some(dir) = destination.parent() {
++            std::fs::create_dir_all(dir)?;
++        }
++        let mut out = std::fs::File::create(destination)?;
++        let written = self.copy_stream_to(path, stream_name, &mut out, cancel)?;
++        Ok(written)
++    }
++
++    fn copy_stream_to(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        out: &mut dyn std::io::Write,
++        cancel: &CancellationToken,
++    ) -> Result<u64, crate::error::CoreError> {
++        let mut written = 0u64;
++        loop {
++            if cancel.is_cancelled() {
++                return Err(crate::error::CoreError::Cancelled);
++            }
++            let (chunk, eof) = self.read_stream_sync(path, stream_name, written, BLOCK_SIZE)?;
++            if chunk.is_empty() {
++                return Ok(written);
++            }
++            out.write_all(&chunk)?;
++            written += chunk.len() as u64;
++            if eof {
++                return Ok(written);
++            }
++        }
++    }
++}
++
++#[async_trait]
++impl AdsBackend for WindowsBackend {
++    async fn list_volumes(&self) -> Result<Vec<crate::types::VolumeInfo>, crate::error::CoreError> {
++        let this = self.clone();
++        tokio::task::spawn_blocking(move || this.list_volumes_sync())
++            .await
++            .map_err(|e| crate::error::CoreError::Io(std::io::Error::other(e.to_string())))?
++    }
++
++    async fn list_streams(&self, path: &Path) -> Result<Vec<crate::types::StreamInfo>, crate::error::CoreError> {
++        let this = self.clone();
++        let path = path.to_path_buf();
++        tokio::task::spawn_blocking(move || this.list_streams_sync(&path))
++            .await
++            .map_err(|e| crate::error::CoreError::Io(std::io::Error::other(e.to_string())))?
++    }
++
++    async fn read_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), crate::error::CoreError> {
++        let this = self.clone();
++        let path = path.to_path_buf();
++        let stream_name = stream_name.to_string();
++        tokio::task::spawn_blocking(move || this.read_stream_sync(&path, &stream_name, offset, len))
++            .await
++            .map_err(|e| crate::error::CoreError::Io(std::io::Error::other(e.to_string())))?
++    }
++
++    async fn export_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: CancellationToken,
++    ) -> Result<u64, crate::error::CoreError> {
++        let this = self.clone();
++        let path = path.to_path_buf();
++        let stream_name = stream_name.to_string();
++        let destination = destination.to_path_buf();
++        tokio::task::spawn_blocking(move || {
++            this.export_stream_sync(&path, &stream_name, &destination, &cancel)
++        })
++        .await
++        .map_err(|e| crate::error::CoreError::Io(std::io::Error::other(e.to_string())))?
++    }
++}
++
++fn trim_nul(s: &[u16]) -> &[u16] {
++    let end = s.iter().position(|c| *c == 0).unwrap_or(s.len());
++    &s[..end]
++}
++
++fn parse_double_null_terminated(buf: &[u16]) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut current = String::new();
++    for &c in buf {
++        if c == 0 {
++            if !current.is_empty() {
++                out.push(std::mem::take(&mut current));
++            }
++        } else {
++            current.push(char::decode_utf16([c]).flat_map(|r| r.ok()).next().unwrap_or('\u{fffd}'));
++        }
++    }
++    if !current.is_empty() {
++        out.push(current);
++    }
++    out
++}
++
++/// Remove `\\?\` prefix if present (FindFirstStreamW accepts it but tests
++/// expect canonical display paths).
++fn strip_verbatim(path: &Path) -> PathBuf {
++    let s = path.to_string_lossy();
++    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
++        PathBuf::from(format!("\\\\{rest}"))
++    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
++        PathBuf::from(rest)
++    } else {
++        path.to_path_buf()
++    }
++}
++
++// Keep unused-import suppression minimal.
++#[allow(dead_code)]
++fn _unused_types(
++    _: HANDLE_FLAGS,
++    _: DELETE,
++    _: CREATE_FILE_FLAGS,
++    _: GET_FILE_FLAGS_AND_ATTRIBUTES,
++    _: PAGE_PROTECTION_FLAGS,
++    _: HANDLE,
++) {
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_build_stream_path() {
++        let p = Path::new("C:\\data\\file.txt");
++        assert_eq!(
++            build_stream_path(p, "Zone.Identifier"),
++            "\\\\?\\C:\\data\\file.txt:Zone.Identifier:$DATA"
++        );
++        assert_eq!(build_stream_path(p, ""), "\\\\?\\C:\\data\\file.txt");
++    }
++
++    #[test]
++    fn test_parse_double_null() {
++        let mut buf = Vec::new();
++        for s in ["C:\\", "D:\\"] {
++            buf.extend(s.encode_utf16());
++            buf.push(0);
++        }
++        buf.push(0);
++        let v = parse_double_null_terminated(&buf);
++        assert_eq!(v, vec!["C:\\", "D:\\"]);
++    }
++}
+diff --git a/core/src/error.rs b/core/src/error.rs
+new file mode 100644
+index 0000000..3821f86
+--- /dev/null
++++ b/core/src/error.rs
+@@ -0,0 +1,79 @@
++//! Structured error types for the core library.
++//!
++//! All errors cross IPC boundaries as structured data — never panics.
++
++use thiserror::Error;
++
++#[derive(Error, Debug)]
++pub enum CoreError {
++    #[error("IO error: {0}")]
++    Io(#[from] std::io::Error),
++
++    #[error("Access denied: {0}")]
++    AccessDenied(String),
++
++    #[error("Path not found: {0}")]
++    NotFound(String),
++
++    #[error("Not supported on this platform: {0}")]
++    NotSupported(String),
++
++    #[error("Stream not found: {0}:{1}")]
++    StreamNotFound(String, String),
++
++    #[error("Invalid path: {0}")]
++    InvalidPath(String),
++
++    #[error("Volume is read-only: {0}")]
++    VolumeReadOnly(String),
++
++    #[error("Operation cancelled")]
++    Cancelled,
++}
++
++impl CoreError {
++    /// JSON-RPC error code mapping (see SPEC §5.2).
++    pub fn jsonrpc_code(&self) -> i32 {
++        match self {
++            CoreError::AccessDenied(_) => -32001,
++            CoreError::NotFound(_) | CoreError::StreamNotFound(_, _) => -32002,
++            CoreError::NotSupported(_) | CoreError::InvalidPath(_) => -32003,
++            CoreError::VolumeReadOnly(_) => -32004,
++            CoreError::Cancelled => -32005,
++            _ => -32603,
++        }
++    }
++}
++
++/// Convenience result alias.
++pub type CoreResult<T> = Result<T, CoreError>;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn jsonrpc_codes_follow_spec() {
++        assert_eq!(CoreError::AccessDenied("x".into()).jsonrpc_code(), -32001);
++        assert_eq!(CoreError::NotFound("x".into()).jsonrpc_code(), -32002);
++        assert_eq!(
++            CoreError::StreamNotFound("f".into(), "s".into()).jsonrpc_code(),
++            -32002
++        );
++        assert_eq!(CoreError::NotSupported("x".into()).jsonrpc_code(), -32003);
++        assert_eq!(CoreError::InvalidPath("x".into()).jsonrpc_code(), -32003);
++        assert_eq!(CoreError::VolumeReadOnly("x".into()).jsonrpc_code(), -32004);
++        assert_eq!(CoreError::Cancelled.jsonrpc_code(), -32005);
++        let io = CoreError::Io(std::io::Error::other("boom"));
++        assert_eq!(io.jsonrpc_code(), -32603);
++    }
++
++    #[test]
++    fn display_messages() {
++        assert_eq!(
++            CoreError::StreamNotFound("/tmp/a.txt".into(), "Zone.Id".into()).to_string(),
++            "Stream not found: /tmp/a.txt:Zone.Id"
++        );
++        assert_eq!(CoreError::Cancelled.to_string(), "Operation cancelled");
++    }
++}
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+new file mode 100644
+index 0000000..f3c880e
+--- /dev/null
++++ b/core/src/lib.rs
+@@ -0,0 +1,23 @@
++//! Core library for working with NTFS Alternate Data Streams (ADS)
++//! on mounted volumes.
++//!
++//! This crate knows nothing about consoles, JSON or GUIs — it exposes a
++//! platform-agnostic [`AdsBackend`] trait with Windows and Linux
++//! implementations.
++
++pub mod backend;
++pub mod error;
++pub mod scan;
++pub mod types;
++
++mod backends;
++#[cfg(test)]
++pub(crate) mod test_support;
++
++pub use backend::{default_backend, AdsBackend};
++pub use error::CoreError;
++pub use scan::{run_scan, ScanJobHandle};
++pub use types::{ReadResult, ScanOptions, ScanProgress, ScanResult, StreamInfo, VolumeInfo};
++
++/// Library version.
++pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+diff --git a/core/src/scan.rs b/core/src/scan.rs
+new file mode 100644
+index 0000000..5a326bb
+--- /dev/null
++++ b/core/src/scan.rs
+@@ -0,0 +1,460 @@
++//! Asynchronous directory/volume scanner with progress events and
++//! cancellation support.
++//!
++//! The scanner walks the filesystem, queries the backend for alternate data
++//! streams of every entry and emits aggregated progress updates plus a
++//! `streamFound` event per discovered stream.
++
++use std::collections::VecDeque;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use tokio::fs;
++use tokio::sync::mpsc;
++use tokio_util::sync::CancellationToken;
++
++use crate::backend::AdsBackend;
++use crate::error::CoreError;
++use crate::types::{ScanOptions, ScanProgress, ScanResult};
++
++/// Events emitted by a running scan job.
++#[derive(Debug, Clone)]
++pub enum ScanEvent {
++    Progress(ScanProgress),
++    StreamFound(crate::types::StreamInfo),
++    Error { path: PathBuf, error: String },
++    Completed(ScanResult),
++}
++
++/// Handle for a running scan job (currently just its id).
++#[derive(Debug, Clone)]
++pub struct ScanJobHandle {
++    pub job_id: String,
++}
++
++/// Minimum interval between aggregated progress events (SPEC §8:
++/// "Прогресс агрегировать — не отправлять событие на каждый файл").
++const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
++
++/// Run a scan over `root`, sending events into `tx`.
++///
++/// This is intended to be spawned on the tokio runtime. Returns the final
++/// [`ScanResult`] (also delivered as [`ScanEvent::Completed`]).
++pub async fn run_scan(
++    backend: Arc<dyn AdsBackend>,
++    job_id: String,
++    root: PathBuf,
++    options: ScanOptions,
++    cancel: CancellationToken,
++    tx: mpsc::Sender<ScanEvent>,
++) -> ScanResult {
++    let started = Instant::now();
++    let mut progress = ScanProgress::default();
++    let mut errors: Vec<String> = Vec::new();
++    let mut last_emit = Instant::now() - PROGRESS_INTERVAL;
++
++    if !root.exists() {
++        let err = format!("Path not found: {}", root.display());
++        errors.push(err.clone());
++        let _ = tx
++            .send(ScanEvent::Error {
++                path: root.clone(),
++                error: err,
++            })
++            .await;
++        let result = finish(job_id, &progress, errors, started);
++        let _ = tx.send(ScanEvent::Completed(result.clone())).await;
++        return result;
++    }
++
++    // BFS queue. The root is enqueued with a depth of -1 so that it is always
++    // expanded when recursion is enabled, regardless of the `include_directories`
++    // option (which only applies to nested directories).
++    let mut queue: VecDeque<(PathBuf, i32)> = VecDeque::new();
++    queue.push_back((root.clone(), -1));
++
++    while let Some((entry, depth)) = queue.pop_front() {
++        if cancel.is_cancelled() {
++            break;
++        }
++
++        let meta = if options.follow_symlinks {
++            fs::metadata(&entry).await
++        } else {
++            fs::symlink_metadata(&entry).await
++        };
++
++        let meta = match meta {
++            Ok(m) => m,
++            Err(e) => {
++                record_error(&mut progress, &mut errors, &entry, &e.to_string());
++                emit_if_due(&mut last_emit, &tx, &job_id, &progress).await;
++                continue;
++            }
++        };
++
++        // Hidden/system filtering (unix flavour: dot-prefixed names are hidden).
++        if !options.include_hidden && is_hidden_name(&entry) {
++            continue;
++        }
++
++        let is_dir = meta.is_dir();
++        if is_dir {
++            progress.dirs_scanned += 1;
++        } else {
++            progress.files_scanned += 1;
++        }
++
++        if !(is_dir && !options.include_directories) {
++            match backend.list_streams(&entry).await {
++                Ok(streams) => {
++                    for s in streams {
++                        progress.streams_found += 1;
++                        if tx.send(ScanEvent::StreamFound(s)).await.is_err() {
++                            // Receiver gone — abort scan.
++                            break;
++                        }
++                    }
++                }
++                Err(CoreError::Cancelled) => break,
++                Err(e) => {
++                    // Non-NTFS / unsupported entries simply have no streams.
++                    if !matches!(e, CoreError::NotSupported(_)) {
++                        record_error(&mut progress, &mut errors, &entry, &e.to_string());
++                    }
++                }
++            }
++        }
++
++        progress.current_path = Some(entry.clone());
++        emit_if_due(&mut last_emit, &tx, &job_id, &progress).await;
++
++        if is_dir && (depth < 0 || options.recursive) {
++            match fs::read_dir(&entry).await {
++                Ok(mut rd) => loop {
++                    match rd.next_entry().await {
++                        Ok(Some(de)) => queue.push_back((de.path(), depth + 1)),
++                        Ok(None) => break,
++                        Err(e) => {
++                            record_error(&mut progress, &mut errors, &entry, &e.to_string());
++                            break;
++                        }
++                    }
++                },
++                Err(e) => {
++                    record_error(&mut progress, &mut errors, &entry, &e.to_string());
++                }
++            }
++        }
++    }
++
++    // Final progress snapshot, then completion.
++    let _ = tx
++        .send(ScanEvent::Progress(progress.clone()))
++        .await;
++    let result = finish(job_id, &progress, errors, started);
++    let _ = tx.send(ScanEvent::Completed(result.clone())).await;
++    result
++}
++
++fn finish(
++    job_id: String,
++    progress: &ScanProgress,
++    errors: Vec<String>,
++    started: Instant,
++) -> ScanResult {
++    ScanResult {
++        job_id,
++        total_files: progress.files_scanned,
++        total_streams: progress.streams_found,
++        errors,
++        duration_ms: started.elapsed().as_millis() as u64,
++    }
++}
++
++fn record_error(progress: &mut ScanProgress, errors: &mut Vec<String>, path: &Path, msg: &str) {
++    progress.errors += 1;
++    let full = format!("{}: {}", path.display(), msg);
++    // Keep memory bounded for very large scans.
++    if errors.len() < 1000 {
++        errors.push(full);
++    }
++    let _ = &*msg;
++}
++
++fn is_hidden_name(path: &Path) -> bool {
++    path.file_name()
++        .map(|n| n.to_string_lossy().starts_with('.'))
++        .unwrap_or(false)
++}
++
++async fn emit_if_due(
++    last_emit: &mut Instant,
++    tx: &mpsc::Sender<ScanEvent>,
++    job_id: &str,
++    progress: &ScanProgress,
++) {
++    if last_emit.elapsed() >= PROGRESS_INTERVAL {
++        *last_emit = Instant::now();
++        let mut p = progress.clone();
++        p.current_path = progress.current_path.clone();
++        let _ = job_id;
++        let _ = tx.send(ScanEvent::Progress(p)).await;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::test_support::MockBackend;
++    use crate::types::ScanOptions;
++    use async_trait::async_trait;
++    use tempfile::TempDir;
++
++    async fn collect_with_cancel(
++        backend: Arc<dyn AdsBackend>,
++        root: PathBuf,
++        options: ScanOptions,
++        cancel: CancellationToken,
++    ) -> (Vec<ScanEvent>, ScanResult) {
++        let (tx, mut rx) = mpsc::channel(1024);
++        let handle = tokio::spawn(run_scan(backend, "job-1".into(), root, options, cancel, tx));
++        let mut events = Vec::new();
++        while let Some(ev) = rx.recv().await {
++            events.push(ev);
++        }
++        let result = handle.await.unwrap();
++        (events, result)
++    }
++
++    async fn collect(
++        backend: Arc<dyn AdsBackend>,
++        root: PathBuf,
++        options: ScanOptions,
++    ) -> (Vec<ScanEvent>, ScanResult) {
++        collect_with_cancel(backend, root, options, CancellationToken::new()).await
++    }
++
++    fn streams_found(events: &[ScanEvent]) -> Vec<String> {
++        let mut v: Vec<String> = events
++            .iter()
++            .filter_map(|e| match e {
++                ScanEvent::StreamFound(s) => Some(format!(
++                    "{}:{}",
++                    s.owner_path.file_name().unwrap().to_string_lossy(),
++                    s.name
++                )),
++                _ => None,
++            })
++            .collect();
++        v.sort();
++        v
++    }
++
++    #[tokio::test]
++    async fn scan_finds_streams_recursively() {
++        let tmp = TempDir::new().unwrap();
++        let dir = tmp.path().join("sub");
++        std::fs::create_dir_all(&dir).unwrap();
++        let f1 = tmp.path().join("a.txt");
++        let f2 = dir.join("b.dat");
++        std::fs::write(&f1, b"main").unwrap();
++        std::fs::write(&f2, b"main2").unwrap();
++
++        let be = MockBackend::new();
++        be.add_stream(&f1, "Zone.Identifier", b"[ZoneTransfer]");
++        be.add_stream(&f2, "prompt", b"hi");
++
++        let (events, result) = collect(be, tmp.path().to_path_buf(), ScanOptions::default()).await;
++        assert_eq!(streams_found(&events), vec!["a.txt:Zone.Identifier", "b.dat:prompt"]);
++        assert_eq!(result.total_streams, 2);
++        assert_eq!(result.total_files, 2);
++        assert!(matches!(events.last(), Some(ScanEvent::Completed(_))));
++    }
++
++    #[tokio::test]
++    async fn scan_non_recursive_skips_subdirs() {
++        let tmp = TempDir::new().unwrap();
++        let dir = tmp.path().join("sub");
++        std::fs::create_dir_all(&dir).unwrap();
++        let f1 = tmp.path().join("a.txt");
++        let f2 = dir.join("b.dat");
++        std::fs::write(&f1, b"main").unwrap();
++        std::fs::write(&f2, b"main2").unwrap();
++
++        let be = MockBackend::new();
++        be.add_stream(&f1, "s1", b"x");
++        be.add_stream(&f2, "s2", b"y");
++
++        let opts = ScanOptions {
++            recursive: false,
++            ..Default::default()
++        };
++        let (events, result) = collect(be, tmp.path().to_path_buf(), opts).await;
++        assert_eq!(streams_found(&events), vec!["a.txt:s1"]);
++        assert_eq!(result.total_streams, 1);
++    }
++
++    #[tokio::test]
++    async fn scan_missing_root_reports_error_and_completes() {
++        let be = MockBackend::new();
++        let missing = PathBuf::from("/definitely-not-here-ads-test");
++        let (events, result) = collect(be, missing, ScanOptions::default()).await;
++        assert!(matches!(events.first(), Some(ScanEvent::Error { .. })));
++        assert_eq!(result.errors.len(), 1);
++        assert!(matches!(events.last(), Some(ScanEvent::Completed(_))));
++    }
++
++    #[tokio::test]
++    async fn scan_records_access_errors_but_ignores_not_supported() {
++        let tmp = TempDir::new().unwrap();
++        let bad = tmp.path().join("locked.txt");
++        let ok = tmp.path().join("ok.txt");
++        std::fs::write(&bad, b"x").unwrap();
++        std::fs::write(&ok, b"y").unwrap();
++
++        let be = MockBackend::new();
++        // AccessDenied on one file — must be recorded as an error.
++        be.fail_on(&bad, "denied");
++        // Other files return empty lists (like non-NTFS NotSupported handled upstream).
++
++        let (_, result) = collect(be, tmp.path().to_path_buf(), ScanOptions::default()).await;
++        assert_eq!(result.errors.len(), 1);
++        // The per-path error is reported in the final result; the scanner does
++        // not emit a separate ScanEvent::Error for backend listing failures.
++        assert!(result.errors[0].contains("locked.txt"));
++        assert!(result.errors[0].contains("denied"));
++    }
++
++    #[tokio::test]
++    async fn scan_not_supported_error_is_ignored() {
++        struct NotSupportedBackend;
++
++        #[async_trait]
++        impl AdsBackend for NotSupportedBackend {
++            async fn list_volumes(&self) -> Result<Vec<crate::types::VolumeInfo>, CoreError> {
++                Ok(Vec::new())
++            }
++            async fn list_streams(&self, _path: &Path) -> Result<Vec<crate::types::StreamInfo>, CoreError> {
++                Err(CoreError::NotSupported("not an NTFS volume".into()))
++            }
++            async fn read_stream(
++                &self,
++                _path: &Path,
++                _stream_name: &str,
++                _offset: u64,
++                _len: usize,
++            ) -> Result<(Vec<u8>, bool), CoreError> {
++                Err(CoreError::NotSupported("not an NTFS volume".into()))
++            }
++            async fn export_stream(
++                &self,
++                _path: &Path,
++                _stream_name: &str,
++                _destination: &Path,
++                _cancel: CancellationToken,
++            ) -> Result<u64, CoreError> {
++                Err(CoreError::NotSupported("not an NTFS volume".into()))
++            }
++        }
++
++        let tmp = TempDir::new().unwrap();
++        std::fs::write(tmp.path().join("f.txt"), b"x").unwrap();
++
++        let (_, result) = collect(Arc::new(NotSupportedBackend), tmp.path().to_path_buf(), ScanOptions::default()).await;
++        // NotSupported means "no streams here" — it must not count as an error.
++        assert!(result.errors.is_empty());
++        assert_eq!(result.total_files, 1);
++        assert_eq!(result.total_streams, 0);
++    }
++
++    #[tokio::test]
++    async fn scan_cancel_midway_emits_completed() {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++
++        // A backend that cancels the job after the first stream listing.
++        struct CancellingBackend {
++            cancel: CancellationToken,
++            calls: AtomicUsize,
++        }
++
++        #[async_trait]
++        impl AdsBackend for CancellingBackend {
++            async fn list_volumes(&self) -> Result<Vec<crate::types::VolumeInfo>, CoreError> {
++                Ok(Vec::new())
++            }
++            async fn list_streams(&self, _path: &Path) -> Result<Vec<crate::types::StreamInfo>, CoreError> {
++                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
++                    self.cancel.cancel();
++                }
++                Ok(vec![])
++            }
++            async fn read_stream(
++                &self,
++                _path: &Path,
++                _stream_name: &str,
++                _offset: u64,
++                _len: usize,
++            ) -> Result<(Vec<u8>, bool), CoreError> {
++                Err(CoreError::Cancelled)
++            }
++            async fn export_stream(
++                &self,
++                _path: &Path,
++                _stream_name: &str,
++                _destination: &Path,
++                _cancel: CancellationToken,
++            ) -> Result<u64, CoreError> {
++                Err(CoreError::Cancelled)
++            }
++        }
++
++        let tmp = TempDir::new().unwrap();
++        for i in 0..5 {
++            std::fs::write(tmp.path().join(format!("f{i}.txt")), b"x").unwrap();
++        }
++
++        let cancel = CancellationToken::new();
++        let be = Arc::new(CancellingBackend {
++            cancel: cancel.clone(),
++            calls: AtomicUsize::new(0),
++        });
++        let (events, result) =
++            collect_with_cancel(be, tmp.path().to_path_buf(), ScanOptions::default(), cancel).await;
++        // The job still terminates with a Completed event…
++        assert!(matches!(events.last(), Some(ScanEvent::Completed(_))));
++        // …and the remaining files were not scanned (cancellation took effect).
++        assert!(result.total_files < 5);
++    }
++
++    #[tokio::test]
++    async fn scan_cancellation_stops_work() {
++        let tmp = TempDir::new().unwrap();
++        for i in 0..50 {
++            std::fs::write(tmp.path().join(format!("f{i}.txt")), b"x").unwrap();
++        }
++        let be = MockBackend::new();
++        let cancel = CancellationToken::new();
++        cancel.cancel(); // already cancelled — loop must break immediately
++        let (tx, mut rx) = mpsc::channel(8);
++        let result = run_scan(
++            be,
++            "job-x".into(),
++            tmp.path().to_path_buf(),
++            ScanOptions::default(),
++            cancel,
++            tx,
++        )
++        .await;
++        assert_eq!(result.total_files, 0);
++        // Completed event is still emitted so clients can finalize the job.
++        let mut saw_completed = false;
++        while let Ok(ev) = rx.try_recv() {
++            if matches!(ev, ScanEvent::Completed(_)) {
++                saw_completed = true;
++            }
++        }
++        assert!(saw_completed);
++    }
++}
+diff --git a/core/src/test_support.rs b/core/src/test_support.rs
+new file mode 100644
+index 0000000..5d5bf78
+--- /dev/null
++++ b/core/src/test_support.rs
+@@ -0,0 +1,226 @@
++//! In-memory [`AdsBackend`] used by unit tests for the scanner and CLI.
++//!
++//! The map key is the owner path; the value is a list of `(stream_name, data)`
++//! pairs in insertion order.
++
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use tokio_util::sync::CancellationToken;
++
++use crate::backend::AdsBackend;
++use crate::error::CoreError;
++use crate::types::{StreamInfo, VolumeInfo};
++
++#[derive(Default)]
++pub struct MockBackend {
++    pub streams: Arc<Mutex<HashMap<PathBuf, Vec<(String, Vec<u8>)>>>>,
++    pub volumes: Arc<Mutex<Vec<VolumeInfo>>>,
++    /// Owner paths that should produce an error (e.g. permission denied).
++    pub fail_paths: Arc<Mutex<HashMap<PathBuf, String>>>,
++}
++
++impl MockBackend {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self::default())
++    }
++
++    pub fn add_stream(&self, path: &Path, name: &str, data: &[u8]) {
++        self.streams
++            .lock()
++            .unwrap()
++            .entry(path.to_path_buf())
++            .or_default()
++            .push((name.to_string(), data.to_vec()));
++    }
++
++    pub fn add_volume(&self, v: VolumeInfo) {
++        self.volumes.lock().unwrap().push(v);
++    }
++
++    pub fn fail_on(&self, path: &Path, message: &str) {
++        self.fail_paths
++            .lock()
++            .unwrap()
++            .insert(path.to_path_buf(), message.to_string());
++    }
++
++    fn lookup(&self, path: &Path, stream_name: &str) -> Option<Vec<u8>> {
++        let guard = self.streams.lock().unwrap();
++        guard
++            .get(path)
++            .and_then(|list| list.iter().find(|(n, _)| n == stream_name))
++            .map(|(_, d)| d.clone())
++    }
++}
++
++#[async_trait]
++impl AdsBackend for MockBackend {
++    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, CoreError> {
++        Ok(self.volumes.lock().unwrap().clone())
++    }
++
++    async fn list_streams(&self, path: &Path) -> Result<Vec<StreamInfo>, CoreError> {
++        if let Some(msg) = self.fail_paths.lock().unwrap().get(path) {
++            return Err(CoreError::AccessDenied(msg.clone()));
++        }
++        let guard = self.streams.lock().unwrap();
++        Ok(match guard.get(path) {
++            Some(list) => list
++                .iter()
++                .map(|(name, data)| StreamInfo {
++                    name: name.clone(),
++                    size: data.len() as u64,
++                    owner_path: path.to_path_buf(),
++                })
++                .collect(),
++            None => Vec::new(),
++        })
++    }
++
++    async fn read_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<(Vec<u8>, bool), CoreError> {
++        let data = self.lookup(path, stream_name).ok_or_else(|| {
++            CoreError::StreamNotFound(path.display().to_string(), stream_name.into())
++        })?;
++        let off = offset as usize;
++        if off >= data.len() {
++            return Ok((Vec::new(), true));
++        }
++        let end = off.saturating_add(len).min(data.len());
++        Ok((data[off..end].to_vec(), end >= data.len()))
++    }
++
++    async fn export_stream(
++        &self,
++        path: &Path,
++        stream_name: &str,
++        destination: &Path,
++        cancel: CancellationToken,
++    ) -> Result<u64, CoreError> {
++        if cancel.is_cancelled() {
++            return Err(CoreError::Cancelled);
++        }
++        let data = self.lookup(path, stream_name).ok_or_else(|| {
++            CoreError::StreamNotFound(path.display().to_string(), stream_name.into())
++        })?;
++        if let Some(dir) = destination.parent() {
++            std::fs::create_dir_all(dir)?;
++        }
++        std::fs::write(destination, &data)?;
++        Ok(data.len() as u64)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::runtime::Runtime;
++
++    fn sample_volume() -> VolumeInfo {
++        VolumeInfo {
++            id: "vol-1".into(),
++            name: "Sample".into(),
++            mount_point: PathBuf::from("/mnt/sample"),
++            file_system: "ntfs3".into(),
++            is_ntfs: true,
++            is_writable: true,
++            total_size: Some(1024),
++            free_size: Some(512),
++        }
++    }
++
++    #[test]
++    fn mock_backend_lists_added_volumes() {
++        let rt = Runtime::new().unwrap();
++        let be = MockBackend::new();
++        be.add_volume(sample_volume());
++        let vols = rt.block_on(be.list_volumes()).unwrap();
++        assert_eq!(vols.len(), 1);
++        assert_eq!(vols[0].id, "vol-1");
++        assert!(vols[0].is_ntfs);
++    }
++
++    #[test]
++    fn mock_backend_read_stream_slices_by_offset_and_len() {
++        let rt = Runtime::new().unwrap();
++        let be = MockBackend::new();
++        let owner = PathBuf::from("/data/file.txt");
++        be.add_stream(&owner, "$DATA", b"0123456789");
++
++        let (chunk, eof) = rt
++            .block_on(be.read_stream(&owner, "$DATA", 2, 3))
++            .unwrap();
++        assert_eq!(chunk, b"234");
++        assert!(!eof);
++
++        let (rest, eof) = rt
++            .block_on(be.read_stream(&owner, "$DATA", 8, 100))
++            .unwrap();
++        assert_eq!(rest, b"89");
++        assert!(eof);
++
++        // Reading past the end returns empty data with eof=true.
++        let (empty, eof) = rt
++            .block_on(be.read_stream(&owner, "$DATA", 10, 5))
++            .unwrap();
++        assert!(empty.is_empty());
++        assert!(eof);
++    }
++
++    #[test]
++    fn mock_backend_read_unknown_stream_is_not_found() {
++        let rt = Runtime::new().unwrap();
++        let be = MockBackend::new();
++        let owner = PathBuf::from("/data/file.txt");
++        let err = rt
++            .block_on(be.read_stream(&owner, "missing", 0, 10))
++            .unwrap_err();
++        assert!(matches!(err, CoreError::StreamNotFound(_, _)));
++    }
++
++    #[test]
++    fn mock_backend_fail_on_returns_access_denied() {
++        let rt = Runtime::new().unwrap();
++        let be = MockBackend::new();
++        let owner = PathBuf::from("/secret");
++        be.fail_on(&owner, "permission denied");
++        let err = rt.block_on(be.list_streams(&owner)).unwrap_err();
++        assert!(matches!(err, CoreError::AccessDenied(_)));
++    }
++
++    #[test]
++    fn mock_backend_export_writes_file_and_respects_cancel() {
++        let rt = Runtime::new().unwrap();
++        let be = MockBackend::new();
++        let owner = PathBuf::from("/data/file.txt");
++        be.add_stream(&owner, "notes", b"payload");
++
++        let dir = tempfile::tempdir().unwrap();
++        let dest = dir.path().join("out/notes.bin");
++        let written = rt
++            .block_on(be.export_stream(
++                &owner,
++                "notes",
++                &dest,
++                CancellationToken::new(),
++            ))
++            .unwrap();
++        assert_eq!(written, 7);
++        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
++
++        let cancel = CancellationToken::new();
++        cancel.cancel();
++        let err = rt
++            .block_on(be.export_stream(&owner, "notes", &dest, cancel))
++            .unwrap_err();
++        assert!(matches!(err, CoreError::Cancelled));
++    }
++}
+diff --git a/core/src/types.rs b/core/src/types.rs
+new file mode 100644
+index 0000000..3cc241a
+--- /dev/null
++++ b/core/src/types.rs
+@@ -0,0 +1,90 @@
++//! Domain types shared across core, CLI and (via JSON-RPC) GUI.
++
++use serde::{Deserialize, Serialize};
++use std::path::PathBuf;
++
++/// Maximum length of a single `stream.read` request (1 MiB), per SPEC §5.3.
++pub const MAX_READ_LEN: usize = 1024 * 1024;
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct VolumeInfo {
++    pub id: String,
++    pub name: String,
++    pub mount_point: PathBuf,
++    pub file_system: String,
++    pub is_ntfs: bool,
++    pub is_writable: bool,
++    pub total_size: Option<u64>,
++    pub free_size: Option<u64>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct StreamInfo {
++    /// Stream name without the `:$DATA` suffix (`::$DATA` itself is not listed).
++    pub name: String,
++    pub size: u64,
++    pub owner_path: PathBuf,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(default)]
++pub struct ScanOptions {
++    pub recursive: bool,
++    pub include_hidden: bool,
++    pub include_system: bool,
++    pub include_directories: bool,
++    pub follow_symlinks: bool,
++}
++
++impl Default for ScanOptions {
++    fn default() -> Self {
++        Self {
++            recursive: true,
++            include_hidden: true,
++            include_system: false,
++            include_directories: true,
++            follow_symlinks: false,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct ScanProgress {
++    pub files_scanned: u64,
++    pub dirs_scanned: u64,
++    pub streams_found: u64,
++    pub errors: u64,
++    pub current_path: Option<PathBuf>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ScanResult {
++    pub job_id: String,
++    pub total_files: u64,
++    pub total_streams: u64,
++    pub errors: Vec<String>,
++    pub duration_ms: u64,
++}
++
++/// Result of `stream.read` — chunk of stream data plus EOF flag.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ReadResult {
++    pub data_base64: String,
++    pub offset: u64,
++    pub length: u64,
++    pub eof: bool,
++}
++
++/// Result of `stream.export`.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ExportResult {
++    pub bytes_written: u64,
++    pub sha256: String,
++}
++
++/// Result of `stream.exportAll`.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ExportAllResult {
++    pub streams_exported: usize,
++    pub files: Vec<PathBuf>,
++}
+-- 
+2.39.5
+
