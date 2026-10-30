@@ -32,6 +32,9 @@ public sealed record LogEntry(DateTimeOffset Timestamp, LogLevel Level, string C
 public static class AppLogger
 {
     private const int MemoryCapacity = 5000;
+
+    /// <summary>Cap for the log window's own (filtered) list.</summary>
+    public const int MemoryCapacityUiLimit = 3000;
     private const long MaxFileBytes = 10L * 1024 * 1024; // rotate at ~10 MiB
 
     private static readonly object Sync = new();
@@ -66,8 +69,8 @@ public static class AppLogger
     /// <summary>Bound to the log window's ItemsControl (UI-thread only, throttled).</summary>
     public static ObservableCollection<LogEntry> LiveEntries { get; } = new();
 
-    /// <summary>Raised on the UI thread after items were appended to <see cref="LiveEntries"/>.</summary>
-    public static event EventHandler? EntriesAppended;
+    /// <summary>Raised on the UI thread after batches were appended to <see cref="LiveEntries"/>.</summary>
+    public static event EventHandler<IReadOnlyList<LogEntry>>? EntriesAppended;
 
     public static string LogFilePathDisplay
     {
@@ -124,7 +127,7 @@ public static class AppLogger
                     while (LiveEntries.Count > MemoryCapacity)
                         LiveEntries.RemoveAt(0);
                 }
-                EntriesAppended?.Invoke(null, EventArgs.Empty);
+                EntriesAppended?.Invoke(null, toPublish);
             }, DispatcherPriority.Background);
         }
     }
@@ -134,6 +137,15 @@ public static class AppLogger
     {
         lock (Sync)
             return Entries.ToList();
+    }
+
+    /// <summary>Writes the whole in-memory ring buffer to an arbitrary file (log window "Save…").</summary>
+    public static void ExportTo(string filePath)
+    {
+        var snapshot = Snapshot();
+        using var writer = new StreamWriter(filePath);
+        foreach (var e in snapshot)
+            writer.WriteLine(e.FullText);
     }
 
     private static LinkedListNode<LogEntry>? _lastPublished;

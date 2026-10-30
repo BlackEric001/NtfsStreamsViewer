@@ -113,6 +113,31 @@ public sealed record ScanErrorNotification
     public string Error { get; init; } = string.Empty;
 }
 
+/// <summary>
+/// A single scan error with details. The core reports completion errors as plain
+/// strings in the form "path: message" (see <c>core::scan::record_error</c>).
+/// </summary>
+public sealed record ScanErrorDetail(string Path, string Message, int Occurrences = 1)
+{
+    /// <summary>Splits a raw "path: message" string into path and message parts.</summary>
+    public static ScanErrorDetail Parse(string raw)
+    {
+        // Windows drive paths ("C:\...") must not be split at the drive colon.
+        var idx = raw.IndexOf(": ", StringComparison.Ordinal);
+        if (idx == 1 && raw.Length > 2 && char.IsLetter(raw[0]))
+            idx = raw.IndexOf(": ", idx + 1, StringComparison.Ordinal);
+        return idx > 0
+            ? new ScanErrorDetail(raw[..idx], raw[(idx + 2)..])
+            : new ScanErrorDetail(string.Empty, raw);
+    }
+
+    public string Display => Occurrences > 1
+        ? $"{Path}: {Message} (×{Occurrences})"
+        : $"{Path}: {Message}";
+
+    public override string ToString() => Display;
+}
+
 /// <summary>Payload of the <c>scan.completed</c> notification. Mirrors <c>core::types::ScanResult</c>.</summary>
 public sealed record ScanCompletedNotification
 {
@@ -125,8 +150,19 @@ public sealed record ScanCompletedNotification
     [JsonPropertyName("total_streams")]
     public ulong TotalStreams { get; init; }
 
+    /// <summary>
+    /// Detailed error strings collected by the core ("path: message", capped at 1000).
+    /// NOTE: this is an array, not a count — the count lives in <see cref="ErrorCount"/>.
+    /// </summary>
     [JsonPropertyName("errors")]
-    public ulong Errors { get; init; }
+    public List<string> Errors { get; init; } = new();
+
+    /// <summary>
+    /// Total number of errors (from the last <c>scan.progress</c> notification). The
+    /// completion payload does not carry this number, so the ViewModel fills it in.
+    /// </summary>
+    [JsonIgnore]
+    public ulong ErrorCount { get; set; }
 
     [JsonPropertyName("duration_ms")]
     public ulong DurationMs { get; init; }
