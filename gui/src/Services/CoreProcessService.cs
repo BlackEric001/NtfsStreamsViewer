@@ -105,9 +105,13 @@ public sealed class CoreProcessService : ICoreProcessService
 
     private Task StartProcessAsync()
     {
+        AppLogger.Info("core", "Starting ads-cli sidecar (serve --stdio)…");
         var binaryPath = FindBinary();
         if (binaryPath is null)
         {
+            AppLogger.Error("core",
+                "ads-cli binary not found. Searched: next to the GUI executable, " +
+                "../../cli/target/{release,debug}, PATH.");
             throw new FileNotFoundException(
                 "ads-cli binary not found. Build it with `cargo build --release -p ads-cli` " +
                 "or place it next to the GUI executable / in PATH.");
@@ -124,6 +128,10 @@ public sealed class CoreProcessService : ICoreProcessService
         };
         psi.ArgumentList.Add("serve");
         psi.ArgumentList.Add("--stdio");
+        // Send structured logs from the sidecar to stderr at info level so they end up
+        // in the GUI log window instead of being swallowed by the default "warn" filter.
+        psi.ArgumentList.Add("--log-level");
+        psi.ArgumentList.Add("info");
 
         var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         process.Exited += OnProcessExited;
@@ -131,14 +139,17 @@ public sealed class CoreProcessService : ICoreProcessService
         try
         {
             process.Start();
+            AppLogger.Info("core", $"Started '{binaryPath}' (PID {process.Id}).");
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Error("core", $"Failed to start '{binaryPath}'.", ex);
             process.Dispose();
             throw;
         }
 
-        // Drain stderr so the pipe never fills up and blocks the sidecar.
+        // Drain stderr so the pipe never fills up and blocks the sidecar,
+        // and mirror every line into the application log.
         _ = Task.Run(async () =>
         {
             try
@@ -148,12 +159,13 @@ public sealed class CoreProcessService : ICoreProcessService
                 {
                     var line = await stderr.ReadLineAsync().ConfigureAwait(false);
                     if (line is not null)
-                        System.Diagnostics.Debug.WriteLine($"[ads-cli] {line}");
+                        AppLogger.Info("ads-cli", line);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Process killed mid-read; nothing useful to log here.
+                // Process killed mid-read; harmless, but record it for diagnostics.
+                AppLogger.Debug("ads-cli", $"stderr reader stopped: {ex.Message}");
             }
         });
 

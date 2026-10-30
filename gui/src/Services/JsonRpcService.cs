@@ -144,6 +144,9 @@ public sealed class JsonRpcService : IJsonRpcService
 
         var line = request.ToJsonString() + "\n";
 
+        if (AppLogger.IsEnabled(LogLevel.Debug))
+            AppLogger.Debug("jsonrpc", $"→ {method} (id {id}): {request.ToJsonString()}");
+
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_writeLock)
         {
@@ -160,15 +163,34 @@ public sealed class JsonRpcService : IJsonRpcService
             await stdin.FlushAsync(linked.Token).ConfigureAwait(false);
 
             using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
-            return await tcs.Task.ConfigureAwait(false);
+            JsonElement result;
+            try
+            {
+                result = await tcs.Task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested && !tcs.Task.IsCompleted)
+            {
+                // The request timed out but the sidecar may still answer it later.
+                // Drop it from the pending table so a stale response is ignored instead of leaking.
+                AppLogger.Warning("jsonrpc", $"Request '{method}' (id {id}) timed out after {RequestTimeout}.");
+                throw new TimeoutException($"Request '{method}' timed out after {RequestTimeout}.");
+            }
+            return result;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            AppLogger.Info("jsonrpc", $"Request '{method}' was cancelled by the user.");
             throw;
         }
         catch (OperationCanceledException)
         {
+            AppLogger.Warning("jsonrpc", $"Request '{method}' timed out after {RequestTimeout}.");
             throw new TimeoutException($"Request '{method}' timed out after {RequestTimeout}.");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("jsonrpc", $"Failed to send request '{method}'.", ex);
+            throw;
         }
         finally
         {
@@ -184,33 +206,67 @@ public sealed class JsonRpcService : IJsonRpcService
         _connected = true;
         try
         {
-            var stdout = await _process.GetStdoutAsync().ConfigureAwait(false);
+            var stdout = await GetStdoutSafeAsync().ConfigureAwait(false);
             using var reader = new StreamReader(stdout, System.Text.Encoding.UTF8,
                 detectEncodingFromByteOrderMarks: false, leaveOpen: true);
 
             while (!_lifetimeCts.IsCancellationRequested)
             {
-                var line = await reader.ReadLineAsync(_lifetimeCts.Token).ConfigureAwait(false);
+                string? line;
+                try
+                {
+                    line = await reader.ReadLineAsync(_lifetimeCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break; // shutting down
+                }
                 if (line is null)
+                {
+                    AppLogger.Info("jsonrpc", "stdout reached EOF — sidecar closed the connection.");
                     break; // EOF — process exited
+                }
                 if (line.Length == 0)
                     continue;
                 ProcessLine(line);
             }
         }
+        catch (ObjectDisposedException)
+        {
+            // shutting down
+        }
         catch (OperationCanceledException)
         {
             // shutting down
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Broken pipe / invalid stream state — fail pending requests below.
+            AppLogger.Error("jsonrpc", "Reader loop terminated.", ex);
         }
         finally
         {
             _connected = false;
             FailAllPending(new IOException("Connection to ads-cli was lost."));
         }
+    }
+
+    /// <summary>
+    /// Gets the stdout stream, but never blocks forever on a process that failed to start:
+    /// if shutdown was requested first, we throw instead of hanging in EnsureStartedAsync.
+    /// </summary>
+    private async Task<Stream> GetStdoutSafeAsync()
+    {
+        var getStdout = _process.GetStdoutAsync();
+        var delay = Task.Delay(Timeout.Infinite, _lifetimeCts.Token);
+        var completed = await Task.WhenAny(getStdout, delay).ConfigureAwait(false);
+        if (completed != getStdout)
+        {
+            // Don't leave the original task unobserved.
+            _ = getStdout.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+            throw new OperationCanceledException("Shutting down before the sidecar started.");
+        }
+        return await getStdout.ConfigureAwait(false);
     }
 
     private void ProcessLine(string line)
@@ -235,15 +291,30 @@ public sealed class JsonRpcService : IJsonRpcService
             if (root.TryGetProperty("method", out var methodEl) &&
                 !root.TryGetProperty("id", out _))
             {
+                var methodName = methodEl.GetString() ?? string.Empty;
+                // scan.progress fires many times per second on large trees — don't log each one.
+                if (AppLogger.IsEnabled(LogLevel.Debug) && methodName != "scan.progress")
+                    AppLogger.Debug("jsonrpc", $"← notification {methodName}: {Truncate(line, 400)}");
                 var args = new JsonRpcNotificationEventArgs(
-                    methodEl.GetString() ?? string.Empty,
+                    methodName,
                     root.TryGetProperty("params", out var p) ? p.Clone() : default);
-                NotificationReceived?.Invoke(this, args);
+                try
+                {
+                    NotificationReceived?.Invoke(this, args);
+                }
+                catch (Exception ex)
+                {
+                    // A buggy handler must never tear down the reader loop.
+                    AppLogger.Error("jsonrpc", $"Notification handler for '{methodName}' threw.", ex);
+                }
                 return;
             }
 
             if (!root.TryGetProperty("id", out var idEl))
+            {
+                AppLogger.Warning("jsonrpc", $"Ignoring message without id: {Truncate(line, 200)}");
                 return; // not something we understand
+            }
 
             long id;
             try
@@ -252,6 +323,7 @@ public sealed class JsonRpcService : IJsonRpcService
             }
             catch
             {
+                AppLogger.Warning("jsonrpc", $"Ignoring response with non-numeric id: {Truncate(line, 200)}");
                 return; // we only ever send numeric ids
             }
 
@@ -262,26 +334,36 @@ public sealed class JsonRpcService : IJsonRpcService
             }
 
             if (pending is null)
+            {
+                if (AppLogger.IsEnabled(LogLevel.Debug))
+                    AppLogger.Debug("jsonrpc", $"Response for unknown/expired id {id}: {Truncate(line, 200)}");
                 return; // response for a cancelled/timed-out request
+            }
 
             if (root.TryGetProperty("error", out var errorEl))
             {
                 var code = errorEl.TryGetProperty("code", out var c) ? c.GetInt32() : JsonRpcException.InternalError;
                 var message = errorEl.TryGetProperty("message", out var m) ? m.GetString() ?? "Unknown error" : "Unknown error";
                 JsonElement? data = errorEl.TryGetProperty("data", out var d) ? d.Clone() : null;
+                AppLogger.Error("jsonrpc", $"← error response (id {id}, code {code}): {message}");
                 pending.Tcs.TrySetException(new JsonRpcException(code, message, data));
             }
             else if (root.TryGetProperty("result", out var resultEl))
             {
+                if (AppLogger.IsEnabled(LogLevel.Debug))
+                    AppLogger.Debug("jsonrpc", $"← result (id {id}): {Truncate(resultEl.GetRawText(), 300)}");
                 pending.Tcs.TrySetResult(resultEl.Clone());
             }
             else
             {
+                AppLogger.Error("jsonrpc", $"Malformed response (id {id}): {Truncate(line, 300)}");
                 pending.Tcs.TrySetException(new JsonRpcException(
                     JsonRpcException.InternalError, "Malformed response: neither result nor error."));
             }
         }
     }
+
+    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
     private void FailAllPending(Exception ex)
     {
@@ -307,13 +389,37 @@ public sealed class JsonRpcService : IJsonRpcService
     public async ValueTask DisposeAsync()
     {
         _process.ProcessExited -= OnProcessExited;
+
+        // Ask the sidecar to shut down gracefully (it exits on stdin EOF) *before* cancelling
+        // our own lifetime token — otherwise a pending EnsureStartedAsync inside the reader
+        // loop could block forever and hang application exit.
+        try
+        {
+            var stdin = await _process.GetStdinAsync().ConfigureAwait(false);
+            stdin.Close();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Debug("jsonrpc", $"closing stdin during dispose: {ex.Message}");
+        }
+
         _lifetimeCts.Cancel();
         FailAllPending(new ObjectDisposedException(nameof(JsonRpcService)));
 
         if (_readerTask is not null)
         {
-            try { await _readerTask.ConfigureAwait(false); }
-            catch { /* best effort */ }
+            try
+            {
+                var finished = await Task.WhenAny(_readerTask, Task.Delay(2000)).ConfigureAwait(false);
+                if (finished != _readerTask)
+                    AppLogger.Warning("jsonrpc", "Reader task did not finish within 2 s during shutdown.");
+                else
+                    await _readerTask.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Debug("jsonrpc", $"reader task ended with: {ex.Message}");
+            }
         }
 
         _lifetimeCts.Dispose();
