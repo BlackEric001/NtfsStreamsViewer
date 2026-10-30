@@ -1,0 +1,14 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:templates="using:Avalonia.Controls.Templates"
+             x:Class="NtfsStreamsViewer.App"
+             RequestedThemeVariant="Default">
+  <!-- "Default" theme variant follows the OS theme (docs/GUI.md Theming). -->
+  <Application.DataTemplates>
+    <templates:ViewLocator/>
+  </Application.DataTemplates>
+  <Application.Styles>
+    <FluentTheme />
+    <StyleInclude Source="avares://NtfsStreamsViewer/Views/Styles.axaml"/>
+  </Application.Styles>
+</Application>

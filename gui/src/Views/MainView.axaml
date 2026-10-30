@@ -1,0 +1,119 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:NtfsStreamsViewer.ViewModels"
+             xmlns:models="using:NtfsStreamsViewer.Models"
+             mc:Ignorable="d" d:DesignWidth="900" d:DesignHeight="500"
+             x:Class="NtfsStreamsViewer.Views.MainView"
+             x:DataType="vm:MainViewModel">
+
+  <UserControl.Resources>
+    <vm:StatusBrushConverter x:Key="StatusBrushConverter"/>
+  </UserControl.Resources>
+
+  <Grid RowDefinitions="Auto,*,Auto,Auto" Margin="8">
+
+    <!-- ===== Toolbar ===== -->
+    <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+      <TextBlock Text="NtfsStreamsViewer" FontSize="16" FontWeight="Bold" VerticalAlignment="Center"/>
+      <Ellipse Width="10" Height="10" VerticalAlignment="Center"
+               Fill="{Binding IsCoreConnected, Converter={StaticResource StatusBrushConverter}}"
+               ToolTip.Tip="ads-cli sidecar connection status"/>
+      <TextBox Width="320" Watermark="Path to scan (defaults to selected volume)"
+               Text="{Binding CurrentScanPath}" VerticalContentAlignment="Center"/>
+      <Button Content="Start Scan" Command="{Binding StartScanCommand}"
+              IsEnabled="{Binding !IsScanning}"/>
+      <Button Content="Cancel" Command="{Binding CancelScanCommand}"
+              IsVisible="{Binding IsScanning}"/>
+      <Button Content="Refresh Volumes" Command="{Binding RefreshVolumesCommand}"
+              HorizontalAlignment="Right"/>
+    </StackPanel>
+
+    <!-- ===== Main area: volumes | results | preview ===== -->
+    <Grid Grid.Row="1" ColumnDefinitions="240,*,300">
+
+      <!-- Volumes panel -->
+      <Border Classes="panel" Background="{DynamicResource SolidBackgroundFillColorBaseBrush}"
+              BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+              Margin="0,0,8,0">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Classes="sectionHeader" Text="Volumes"/>
+          <ListBox ItemsSource="{Binding Volumes}"
+                   SelectedItem="{Binding SelectedVolume}">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="models:VolumeInfo">
+                <StackPanel Spacing="2" Margin="2">
+                  <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"/>
+                  <TextBlock Text="{Binding MountPoint}" FontSize="11" Opacity="0.7"/>
+                  <TextBlock Text="{Binding SizeSummary}" FontSize="11" Opacity="0.7"/>
+                </StackPanel>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+
+      <!-- Scan results panel -->
+      <Border Grid.Column="1" Classes="panel" Background="{DynamicResource SolidBackgroundFillColorBaseBrush}"
+              BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+              Margin="0,0,8,0">
+        <DockPanel>
+          <WrapPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+            <TextBlock Classes="sectionHeader" Text="Scan results" VerticalAlignment="Center" Margin="0,0,12,0"/>
+            <CheckBox Content="Recursive" IsChecked="{Binding Recursive}" FontSize="11" Margin="0,0,8,0"/>
+            <CheckBox Content="Hidden" IsChecked="{Binding IncludeHidden}" FontSize="11" Margin="0,0,8,0"/>
+            <CheckBox Content="System" IsChecked="{Binding IncludeSystem}" FontSize="11" Margin="0,0,8,0"/>
+            <CheckBox Content="Dirs" IsChecked="{Binding IncludeDirectories}" FontSize="11" Margin="0,0,8,0"/>
+            <CheckBox Content="Symlinks" IsChecked="{Binding FollowSymlinks}" FontSize="11" Margin="0,0,12,0"/>
+            <TextBox Watermark="Filter…" Text="{Binding FilterText}" Width="160"/>
+          </WrapPanel>
+
+          <ListBox ItemsSource="{Binding FilteredResults}"
+                   SelectedItem="{Binding SelectedResult}"
+                   DoubleTapped="OnResultDoubleTapped">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:ScanStreamItem">
+                <Grid ColumnDefinitions="2*,2*,*,Auto" Margin="2">
+                  <TextBlock Grid.Column="0" Text="{Binding FileName}"
+                             TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding OwnerDirectory}"/>
+                  <TextBlock Grid.Column="1" Text="{Binding StreamName}"
+                             TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding SizeText}" VerticalAlignment="Center"/>
+                  <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4">
+                    <Button Content="View" Padding="8,2" Click="OnViewClick" Tag="{Binding}"/>
+                    <Button Content="Export" Padding="8,2" Click="OnExportClick" Tag="{Binding}"/>
+                  </StackPanel>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+
+      <!-- Preview panel (hosts a StreamPreviewView when a stream is opened) -->
+      <Border Grid.Column="2" Classes="panel" Background="{DynamicResource SolidBackgroundFillColorBaseBrush}"
+              BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+        <ContentControl Content="{Binding Preview}"/>
+      </Border>
+    </Grid>
+
+    <!-- ===== Progress bar ===== -->
+    <Border Grid.Row="2" Classes="panel" Margin="0,8,0,4"
+            Background="{DynamicResource SolidBackgroundFillColorBaseBrush}"
+            BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+      <StackPanel Spacing="4">
+        <ProgressBar IsIndeterminate="{Binding IsScanning}" IsVisible="{Binding IsScanning}"/>
+        <StackPanel Orientation="Horizontal" Spacing="16">
+          <TextBlock Text="{Binding FilesScanned, StringFormat='Files: {0}'}"/>
+          <TextBlock Text="{Binding StreamsFound, StringFormat='Streams: {0}'}"/>
+          <TextBlock Text="{Binding ErrorsCount, StringFormat='Errors: {0}'}"/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+
+    <!-- ===== Status bar ===== -->
+    <TextBlock Grid.Row="3" Text="{Binding StatusMessage}"
+               TextTrimming="CharacterEllipsis" Opacity="0.8" Margin="2,2,0,0"/>
+  </Grid>
+</UserControl>
