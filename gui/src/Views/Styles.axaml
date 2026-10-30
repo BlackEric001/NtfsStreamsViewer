@@ -1,0 +1,19 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <Style Selector="TextBox.monospace TextBlock, SelectableTextBlock.monospace">
+    <Setter Property="FontFamily" Value="Cascadia Mono, Consolas, Menlo, monospace"/>
+  </Style>
+
+  <Style Selector="Border.panel">
+    <Setter Property="Padding" Value="8"/>
+    <Setter Property="CornerRadius" Value="4"/>
+  </Style>
+
+  <Style Selector="TextBlock.sectionHeader">
+    <Setter Property="FontSize" Value="13"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Margin" Value="0,0,0,6"/>
+  </Style>
+
+</Styles>

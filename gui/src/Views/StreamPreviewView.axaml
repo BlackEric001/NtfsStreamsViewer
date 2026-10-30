@@ -1,0 +1,36 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:NtfsStreamsViewer.ViewModels"
+             mc:Ignorable="d" d:DesignWidth="300" d:DesignHeight="500"
+             x:Class="NtfsStreamsViewer.Views.StreamPreviewView"
+             x:DataType="vm:StreamPreviewViewModel">
+
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Top" Spacing="4" Margin="0,0,0,6">
+      <TextBlock Text="{Binding StreamName, StringFormat='Preview: {0}'}"
+                 Classes="sectionHeader" TextTrimming="CharacterEllipsis"/>
+      <TextBlock Text="{Binding OwnerPath}" FontSize="10" Opacity="0.7"
+                 TextTrimming="CharacterEllipsis"/>
+      <StackPanel Orientation="Horizontal" Spacing="6">
+        <!-- Two mutually exclusive buttons emulate the Text/Hex toggle from the spec -->
+        <Button Content="Text" Command="{Binding ShowTextCommand}" Padding="8,2"/>
+        <Button Content="Hex" Command="{Binding ShowHexCommand}" Padding="8,2"/>
+        <Button Content="Load more" Command="{Binding LoadMoreCommand}"
+                IsEnabled="{Binding HasMoreData}" Padding="8,2"/>
+        <Button Content="Reload" Command="{Binding ReloadCommand}" Padding="8,2"/>
+      </StackPanel>
+    </StackPanel>
+
+    <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" FontSize="10"
+               Opacity="0.7" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+
+    <ScrollViewer>
+      <SelectableTextBlock Text="{Binding Content}"
+                           FontFamily="Cascadia Mono, Consolas, Menlo, monospace"
+                           FontSize="11"
+                           TextWrapping="Wrap"/>
+    </ScrollViewer>
+  </DockPanel>
+</UserControl>
