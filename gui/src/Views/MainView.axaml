@@ -3,6 +3,7 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:vm="using:NtfsStreamsViewer.ViewModels"
+             xmlns:p="clr-namespace:Avalonia.Data.Converters;assembly=Avalonia.Base"
              xmlns:models="using:NtfsStreamsViewer.Models"
              mc:Ignorable="d" d:DesignWidth="900" d:DesignHeight="500"
              x:Class="NtfsStreamsViewer.Views.MainView"
@@ -26,8 +27,10 @@
               IsEnabled="{Binding !IsScanning}"/>
       <Button Content="Cancel" Command="{Binding CancelScanCommand}"
               IsVisible="{Binding IsScanning}"/>
-      <Button Content="Refresh Volumes" Command="{Binding RefreshVolumesCommand}"
+      <Button Content="Log" Command="{Binding OpenLogCommand}"
+              ToolTip.Tip="Application log &amp; scan error details"
               HorizontalAlignment="Right"/>
+      <Button Content="Refresh Volumes" Command="{Binding RefreshVolumesCommand}"/>
     </StackPanel>
 
     <!-- ===== Main area: volumes | results | preview ===== -->
@@ -107,7 +110,13 @@
         <StackPanel Orientation="Horizontal" Spacing="16">
           <TextBlock Text="{Binding FilesScanned, StringFormat='Files: {0}'}"/>
           <TextBlock Text="{Binding StreamsFound, StringFormat='Streams: {0}'}"/>
-          <TextBlock Text="{Binding ErrorsCount, StringFormat='Errors: {0}'}"/>
+          <StackPanel Orientation="Horizontal" Spacing="6">
+            <TextBlock Text="{Binding ErrorsCount, StringFormat='Errors: {0}'}"
+                       VerticalAlignment="Center"/>
+            <Button Content="Details…" Command="{Binding OpenLogCommand}"
+                    Padding="8,0" FontSize="11" VerticalAlignment="Center"
+                    IsVisible="{Binding ErrorsCount, Converter={x:Static p:ObjectConverters.IsNotNull}}"/>
+          </StackPanel>
         </StackPanel>
       </StackPanel>
     </Border>

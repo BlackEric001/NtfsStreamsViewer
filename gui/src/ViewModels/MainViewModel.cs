@@ -59,6 +59,9 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
     [ObservableProperty]
     private string _statusMessage = string.Empty;
 
+    /// <summary>Number of distinct error rows collected during the current/last scan.</summary>
+    public int ScanErrorListCount => ScanErrorDetails.Count;
+
     [ObservableProperty]
     private bool _isCoreConnected;
 
@@ -108,8 +111,28 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
     /// <summary>Raised when the sidecar process crashed — the view shows a restart dialog.</summary>
     public event EventHandler<string>? CoreCrashDetected;
 
+    /// <summary>Raised (on the UI thread) when the collected scan-error details change.</summary>
+    public event EventHandler<IReadOnlyList<ScanErrorDetail>>? ScanErrorsChanged;
+
+    /// <summary>Cap for the in-memory error-detail list (the core itself caps at 1000).</summary>
+    private const int MaxErrorDetails = 2000;
+
+    private readonly List<ScanErrorDetail> _scanErrors = new();
+
+    /// <summary>Per-path error details collected during the current/last scan.</summary>
+    public IReadOnlyList<ScanErrorDetail> ScanErrorDetails
+    {
+        get { lock (_scanErrors) return _scanErrors.ToList(); }
+    }
+
+    /// <summary>Last progress notification for the active job (used to fill in error counts).</summary>
+    private ScanProgressNotification? _lastProgress;
+
     private string? _activeJobId;
     private readonly List<ScanStreamItem> _allResults = new();
+
+    /// <summary>True once the user opened the log window — suppresses the completion popup afterwards.</summary>
+    private bool _logWindowOpened;
 
     public MainViewModel(ICoreClient core, IJsonRpcService rpc)
     {
@@ -117,6 +140,81 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
         _rpc = rpc;
         _rpc.NotificationReceived += OnNotificationReceived;
         _core.CoreCrashed += OnCoreCrashed;
+    }
+
+    /// <summary>Called by the log window so we can stop nagging with popups about scan errors.</summary>
+    public void NotifyLogWindowOpened() => _logWindowOpened = true;
+
+    public void ClearScanErrors()
+    {
+        lock (_scanErrors)
+        {
+            _scanErrors.Clear();
+            _errorIndex.Clear();
+        }
+        ScanErrorsChanged?.Invoke(this, Array.Empty<ScanErrorDetail>());
+    }
+
+    /// <summary>
+    /// Adds a scan error to the detail list. Identical (path, message) pairs are
+    /// coalesced into one row with an occurrence counter so a permission-denied wall
+    /// on a big tree cannot flood the UI.
+    /// </summary>
+    private void AddScanError(string path, string message)
+    {
+        var key = path + "\n" + message;
+        bool changed;
+        lock (_scanErrors)
+        {
+            if (_errorIndex.TryGetValue(key, out var idx))
+            {
+                _scanErrors[idx] = _scanErrors[idx] with { Occurrences = _scanErrors[idx].Occurrences + 1 };
+                changed = false; // counter-only update: no need to re-notify yet
+            }
+            else
+            {
+                if (_scanErrors.Count >= MaxErrorDetails)
+                    return;
+                _errorIndex[key] = _scanErrors.Count;
+                _scanErrors.Add(new ScanErrorDetail(path, message));
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            Interlocked.Exchange(ref _errorsDirtyFlag, 1);
+            ScheduleErrorFlush();
+        }
+    }
+
+    private readonly Dictionary<string, int> _errorIndex = new(StringComparer.Ordinal);
+    /// <summary>0/1 flag (accessed via <see cref="Interlocked"/>) — details need a UI refresh.</summary>
+    private int _errorsDirtyFlag;
+    private System.Threading.Timer? _errorFlushTimer;
+
+    /// <summary>Coalesces error-list notifications to at most one refresh per 500 ms.</summary>
+    private void ScheduleErrorFlush()
+    {
+        if (_errorFlushTimer is null)
+        {
+            _errorFlushTimer = new System.Threading.Timer(_ => FlushErrorChanges(), null,
+                TimeSpan.FromMilliseconds(500), Timeout.InfiniteTimeSpan);
+        }
+        else
+        {
+            _errorFlushTimer.Change(TimeSpan.FromMilliseconds(500), Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    private void FlushErrorChanges()
+    {
+        // Whoever wins the atomic swap performs the notification (timer ticks and
+        // completion merges can race here).
+        if (Interlocked.Exchange(ref _errorsDirtyFlag, 0) == 0)
+            return;
+        var snapshot = ScanErrorDetails;
+        Dispatcher.UIThread.Post(
+            () => ScanErrorsChanged?.Invoke(this, snapshot));
     }
 
     public async Task InitializeAsync()
@@ -176,6 +274,8 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
             FilesScanned = 0;
             StreamsFound = 0;
             ErrorsCount = 0;
+            _lastProgress = null;
+            ClearScanErrors();
 
             var options = new ScanOptions
             {
@@ -238,6 +338,12 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
             ExportRequested?.Invoke(this, target.Stream);
     }
 
+    /// <summary>Raised when the user asks to open the log window (handled by MainWindow).</summary>
+    public event EventHandler? OpenLogRequested;
+
+    [RelayCommand]
+    private void OpenLog() => OpenLogRequested?.Invoke(this, EventArgs.Empty);
+
     [RelayCommand]
     private async Task RestartCoreAsync()
     {
@@ -255,8 +361,53 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
 
     private void OnNotificationReceived(object? sender, JsonRpcNotificationEventArgs e)
     {
+        // scan.progress fires many times per second on large trees. Posting every one of
+        // them to the Dispatcher saturates the UI queue and the app looks "hung" — so we
+        // coalesce them: while a UI update is queued, newer payloads only overwrite the
+        // snapshot (latest wins). This caps progress repaints at the natural UI cadence.
+        if (e.Method == "scan.progress")
+        {
+            ScheduleProgress(e.Params);
+            return;
+        }
         // Marshal to the UI thread: notifications arrive on the background reader loop.
         Dispatcher.UIThread.Post(() => HandleNotification(e.Method, e.Params));
+    }
+
+    /// <summary>Minimum interval between two scan.progress UI updates.</summary>
+    private const int ProgressThrottleMs = 250;
+
+    private readonly object _progressSync = new();
+    private JsonElement _pendingProgress;
+    private bool _progressScheduled;
+    private DateTimeOffset _lastProgressHandledUtc = DateTimeOffset.MinValue;
+
+    private void ScheduleProgress(JsonElement p)
+    {
+        double waitMs;
+        lock (_progressSync)
+        {
+            _pendingProgress = p;
+            if (_progressScheduled)
+                return; // an update is already queued — it will pick up the latest payload
+            waitMs = Math.Max(0,
+                ProgressThrottleMs - (DateTimeOffset.UtcNow - _lastProgressHandledUtc).TotalMilliseconds);
+            _progressScheduled = true;
+        }
+
+        _ = Task.Delay(TimeSpan.FromMilliseconds(waitMs)).ContinueWith(_ =>
+        {
+            JsonElement snapshot;
+            lock (_progressSync)
+            {
+                snapshot = _pendingProgress;
+                _progressScheduled = false;
+                _lastProgressHandledUtc = DateTimeOffset.UtcNow;
+            }
+            Dispatcher.UIThread.Post(
+                () => HandleNotification("scan.progress", snapshot),
+                DispatcherPriority.Background);
+        }, TaskScheduler.Default);
     }
 
     private void HandleNotification(string method, JsonElement p)
@@ -267,6 +418,7 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
             {
                 var n = Deserialize<ScanProgressNotification>(p);
                 if (n is null || n.JobId != _activeJobId) return;
+                _lastProgress = n;
                 FilesScanned = n.FilesScanned;
                 StreamsFound = n.StreamsFound;
                 ErrorsCount = n.Errors;
@@ -284,7 +436,9 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
                 var n = Deserialize<ScanErrorNotification>(p);
                 if (n is null || n.JobId != _activeJobId) return;
                 ErrorsCount++;
-                StatusMessage = $"Scan error at {n.Path}: {n.Error}";
+                AddScanError(n.Path, n.Error);
+                AppLogger.Warning("scan", $"Error at {n.Path}: {n.Error}");
+                StatusMessage = $"{ErrorsCount} error(s) — open the Log window for details.";
                 break;
             }
             case "scan.completed":
@@ -295,13 +449,35 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
                 _activeJobId = null;
                 FilesScanned = n.TotalFiles;
                 StreamsFound = n.TotalStreams;
-                ErrorsCount = n.Errors;
+                // The completion payload carries detailed errors ("path: message"), not a count.
+                ErrorsCount = Math.Max((ulong)n.Errors.Count, _lastProgress?.Errors ?? 0);
+                n.ErrorCount = ErrorsCount;
+                MergeErrorDetails(n.Errors);
                 StatusMessage =
                     $"Scan finished: {n.TotalFiles} files, {n.TotalStreams} streams, " +
-                    $"{n.Errors} errors in {n.DurationMs} ms.";
+                    $"{ErrorsCount} errors in {n.DurationMs} ms.";
+                if (n.Errors.Count > 0 && !_logWindowOpened)
+                    ScanErrorsWithDetailsDetected?.Invoke(this, n);
                 break;
             }
         }
+    }
+
+    /// <summary>Raised when a scan completed with detailed errors and the log window was never opened.</summary>
+    public event EventHandler<ScanCompletedNotification>? ScanErrorsWithDetailsDetected;
+
+    /// <summary>
+    /// Fills the error list from the completion payload without dropping live scan.error entries.
+    /// </summary>
+    private void MergeErrorDetails(List<string> payloadErrors)
+    {
+        foreach (var raw in payloadErrors)
+        {
+            var d = Models.ScanErrorDetail.Parse(raw);
+            AddScanError(d.Path, d.Message);
+        }
+        // The merged list is authoritative — push it immediately.
+        FlushErrorChanges();
     }
 
     private static T? Deserialize<T>(JsonElement el) where T : class
@@ -364,6 +540,7 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
     {
         _rpc.NotificationReceived -= OnNotificationReceived;
         _core.CoreCrashed -= OnCoreCrashed;
+        _errorFlushTimer?.Dispose();
         return default;
     }
 }
