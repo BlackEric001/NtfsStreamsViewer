@@ -56,6 +56,13 @@ public static class AppLogger
         _ => null,
     };
 
+    /// <summary>All levels, for the log window's level filter combo box.</summary>
+    public static IReadOnlyList<LogLevel> Levels { get; } =
+        (LogLevel[])Enum.GetValues(typeof(LogLevel));
+
+    /// <summary>Total number of ERROR-level entries recorded this session.</summary>
+    public static int ErrorCount { get; private set; }
+
     /// <summary>True when messages at <paramref name="level"/> would be recorded (cheap guard for verbose formatting).</summary>
     public static bool IsEnabled(LogLevel level) => level >= MinimumLevel;
     private static readonly string LogDirectory =
@@ -101,6 +108,8 @@ public static class AppLogger
         List<LogEntry>? toPublish = null;
         lock (Sync)
         {
+            if (level == LogLevel.Error)
+                ErrorCount++;
             Entries.AddLast(entry);
             while (Entries.Count > MemoryCapacity)
                 Entries.RemoveFirst();

@@ -182,13 +182,14 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
         }
         if (changed)
         {
-            _errorsDirty = true;
+            Interlocked.Exchange(ref _errorsDirtyFlag, 1);
             ScheduleErrorFlush();
         }
     }
 
     private readonly Dictionary<string, int> _errorIndex = new(StringComparer.Ordinal);
-    private volatile bool _errorsDirty;
+    /// <summary>0/1 flag (accessed via <see cref="Interlocked"/>) — details need a UI refresh.</summary>
+    private int _errorsDirtyFlag;
     private System.Threading.Timer? _errorFlushTimer;
 
     /// <summary>Coalesces error-list notifications to at most one refresh per 500 ms.</summary>
@@ -207,11 +208,12 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
 
     private void FlushErrorChanges()
     {
-        if (!_errorsDirty)
+        // Whoever wins the atomic swap performs the notification (timer ticks and
+        // completion merges can race here).
+        if (Interlocked.Exchange(ref _errorsDirtyFlag, 0) == 0)
             return;
-        _errorsDirty = false;
         var snapshot = ScanErrorDetails;
-        Avalonia.Threading.Dispatcher.UIThread.Post(
+        Dispatcher.UIThread.Post(
             () => ScanErrorsChanged?.Invoke(this, snapshot));
     }
 
@@ -448,7 +450,7 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
                 FilesScanned = n.TotalFiles;
                 StreamsFound = n.TotalStreams;
                 // The completion payload carries detailed errors ("path: message"), not a count.
-                ErrorsCount = Math.Max(n.Errors.Count, _lastProgress?.Errors ?? 0);
+                ErrorsCount = Math.Max((ulong)n.Errors.Count, _lastProgress?.Errors ?? 0);
                 n.ErrorCount = ErrorsCount;
                 MergeErrorDetails(n.Errors);
                 StatusMessage =
