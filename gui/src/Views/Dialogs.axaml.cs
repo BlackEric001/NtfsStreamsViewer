@@ -1,5 +1,8 @@
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Data;
 using Avalonia.Media;
+using Avalonia.Platform.Storage;
 using NtfsStreamsViewer.Models;
 using NtfsStreamsViewer.Services;
 using NtfsStreamsViewer.ViewModels;
@@ -64,10 +67,10 @@ public static class Dialog
             SizeToContent = SizeToContent.WidthAndHeight,
             CanResize = false,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Owner = owner,
             Content = content,
         };
-
+        // No explicit Owner assignment: WindowBase.Owner has a protected setter in
+        // Avalonia 11, and ShowDialog(owner) below already establishes the owner.
         return window;
     }
 
@@ -97,6 +100,7 @@ public static class ExportDialog
     public static async Task<ExportResult?> ShowAsync(Window owner, ICoreClient core, StreamInfo stream)
     {
         var vm = new ExportViewModel(core, stream);
+        Window? window = null;
 
         var pathBox = new TextBox
         {
@@ -104,9 +108,12 @@ public static class ExportDialog
             Text = vm.DestinationPath,
             Margin = new Avalonia.Thickness(0, 0, 0, 8),
         };
-        // Two-way wiring without bindings for brevity.
-        pathBox.GetObservable(TextBox.TextProperty)
-            .Subscribe(t => vm.DestinationPath = t ?? string.Empty);
+        // Two-way wiring without XAML bindings for brevity.
+        pathBox.Bind(TextBox.TextProperty, new Binding(nameof(ExportViewModel.DestinationPath))
+        {
+            Source = vm,
+            Mode = BindingMode.TwoWay,
+        });
 
         var status = new TextBlock
         {
@@ -119,7 +126,7 @@ public static class ExportDialog
             if (e.PropertyName == nameof(ExportViewModel.StatusMessage))
                 status.Text = vm.StatusMessage;
             if (e.PropertyName == nameof(ExportViewModel.Result) && vm.Result is not null)
-                window.Close(vm.Result);
+                window?.Close(vm.Result);
         };
 
         var exportBtn = new Button
@@ -153,25 +160,25 @@ public static class ExportDialog
         buttons.Children.Add(cancelBtn);
 
         var panel = new StackPanel { Margin = new Avalonia.Thickness(16), Width = 500 };
-        panel.Children.Add(new TextBlock { Text = vm.Title, FontWeight = FontWeights.Bold, Margin = new Avalonia.Thickness(0, 0, 0, 8) });
+        panel.Children.Add(new TextBlock { Text = vm.Title, FontWeight = FontWeight.Bold, Margin = new Avalonia.Thickness(0, 0, 0, 8) });
         panel.Children.Add(new TextBlock { Text = "Source: " + stream.OwnerPath + ":" + stream.Name, TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 0, 8) });
         panel.Children.Add(pathBox);
         panel.Children.Add(status);
         panel.Children.Add(buttons);
 
-        var window = new Window
+        var dlg = new Window
         {
             Title = "Export stream",
             SizeToContent = SizeToContent.WidthAndHeight,
             CanResize = false,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Owner = owner,
             Content = panel,
         };
+        window = dlg;
 
-        cancelBtn.Click += (_, _) => window.Close();
+        cancelBtn.Click += (_, _) => dlg.Close();
 
-        await window.ShowDialog(owner);
+        await dlg.ShowDialog(owner);
         return vm.Result;
     }
 
@@ -190,7 +197,8 @@ public static class ExportDialog
                 DefaultExtension = "bin",
                 Title = "Export destination",
             };
-            var file = await sp.SaveFileAsync(options);
+            // In Avalonia 11 the save picker is exposed as SaveFilePickerAsync.
+            var file = await sp.SaveFilePickerAsync(options);
             return file?.TryGetLocalPath();
         }
     }

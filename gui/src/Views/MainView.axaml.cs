@@ -1,8 +1,10 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.LogicalTree;
 using Avalonia.Markup.Xaml;
+using Avalonia.VisualTree;
 using NtfsStreamsViewer.Models;
 using NtfsStreamsViewer.ViewModels;
 
@@ -10,7 +12,6 @@ namespace NtfsStreamsViewer.Views;
 
 public partial class MainView : UserControl
 {
-    private bool _handlersWired;
     private MainViewModel? _wiredViewModel;
 
     public MainView()
