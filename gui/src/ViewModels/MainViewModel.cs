@@ -360,9 +360,10 @@ public partial class MainViewModel : ViewModelBase, IAsyncDisposable
         });
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         _rpc.NotificationReceived -= OnNotificationReceived;
         _core.CoreCrashed -= OnCoreCrashed;
+        return default;
     }
 }

@@ -21,7 +21,13 @@ public sealed class JsonRpcNotificationEventArgs : EventArgs
 public sealed class JsonRpcException : Exception
 {
     public int Code { get; }
-    public JsonElement? Data { get; }
+
+    /// <summary>
+    /// Structured error data from the JSON-RPC error object (SPEC.md §5.2).
+    /// Declared with <c>new</c> because it hides <see cref="Exception.Data"/>.
+    /// </summary>
+    [JsonPropertyName("data")]
+    public new JsonElement? Data { get; }
 
     public JsonRpcException(int code, string message, JsonElement? data = null)
         : base($"JSON-RPC error {code}: {message}")

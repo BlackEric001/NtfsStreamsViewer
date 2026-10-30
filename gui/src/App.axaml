@@ -1,11 +1,11 @@
 <Application xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:templates="using:Avalonia.Controls.Templates"
+             xmlns:local="using:NtfsStreamsViewer"
              x:Class="NtfsStreamsViewer.App"
              RequestedThemeVariant="Default">
   <!-- "Default" theme variant follows the OS theme (docs/GUI.md Theming). -->
   <Application.DataTemplates>
-    <templates:ViewLocator/>
+    <local:ViewLocator/>
   </Application.DataTemplates>
   <Application.Styles>
     <FluentTheme />

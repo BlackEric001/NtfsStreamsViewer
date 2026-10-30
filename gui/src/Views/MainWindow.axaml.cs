@@ -27,8 +27,7 @@ public partial class MainWindow : Window
         if (DataContext is MainViewModel vm)
         {
             vm.CoreCrashDetected += OnCoreCrashDetected;
-            vm.ExportRequested += (_, stream) =>
-                _ = ExportDialog.ShowAsync(this, AppServices.Client, stream);
+            // ExportRequested is handled by MainView (it wires the dialog with a proper owner).
         }
     }
 
