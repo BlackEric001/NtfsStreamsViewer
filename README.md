@@ -2,6 +2,10 @@
 
 NTFS Alternate Data Streams viewer and editor for Windows and Linux.
 
+Статья на хабре с описанием процесса написания: "Программируем без IDE или применение qwen и qwen coder для написания софта"
+https://habr.com/ru/articles/1102144/
+
+
 ## Features
 
 - Scan mounted NTFS volumes for alternate data streams
